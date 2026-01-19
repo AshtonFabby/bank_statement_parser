@@ -1,0 +1,28 @@
+# Python environment & dependencies
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Environment secrets (CRITICAL: Do not leak API keys/Database URLs)
+.env
+.env.*
+!.env.example
+
+# Database files
+*.db
+*.sqlite3
+
+# FastAPI/Uvicorn specific
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
