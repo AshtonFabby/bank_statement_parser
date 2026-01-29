@@ -2,23 +2,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies for PDF processing
+# Install system dependencies for pdfplumber
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY main.py .
-COPY parsers/ parsers/
-COPY services/ services/
-
-# Create non-root user for security
-RUN useradd --create-home appuser && chown -R appuser:appuser /app
-USER appuser
+COPY . .
 
 EXPOSE 8000
 
