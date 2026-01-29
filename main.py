@@ -11,15 +11,30 @@ from typing import List
 
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from parsers import SUPPORTED_BANKS, get_parser
-from services import calculate_summary, generate_summary_pdf
+from services import (
+    calculate_summary,
+    calculate_coverage,
+    calculate_activity_volume,
+    calculate_revenue,
+    generate_summary_pdf,
+)
 
 app = FastAPI(
     title="Bank Statement Parser API",
     description="Parse bank statements from major South African banks. Supports single or multiple file uploads.",
     version="2.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -31,7 +46,7 @@ def read_root():
         "version": "2.1.0",
         "supported_banks": SUPPORTED_BANKS,
         "endpoints": {
-            "/parse": "POST - Upload one or more PDFs to parse (returns ZIP with Excel + PDF for each, plus combined files)",
+            "/parse": "POST - Upload one or more PDFs to parse (returns ZIP with combined Excel + PDF)",
             "/parse/json": "POST - Upload one or more PDFs to parse (returns JSON with combined results)",
         },
     }
@@ -97,14 +112,13 @@ async def process_single_file(file: UploadFile) -> dict:
 
 @app.post("/parse")
 async def parse_statement(files: List[UploadFile] = File(...)):
-    """Parse one or more bank statement PDFs and return Excel + summary PDF in a ZIP file.
+    """Parse one or more bank statement PDFs and return combined Excel + summary PDF in a ZIP file.
 
     Args:
         files: One or more PDF file uploads
 
     Returns:
-        ZIP file containing parsed Excel and summary PDF for each document,
-        plus combined files when multiple documents are uploaded
+        ZIP file containing combined Excel and summary PDF from all uploaded documents
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_buffer = io.BytesIO()
@@ -118,55 +132,37 @@ async def parse_statement(files: List[UploadFile] = File(...)):
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         all_dfs = []
 
-        for i, result in enumerate(results):
-            bank_name = result["bank_name"]
-            summary = result["summary"]
-            df = result["df"]
-            bank_name_slug = bank_name.lower().replace(" ", "_")
-
-            # Add source column for combined view
-            df_with_source = df.copy()
-            df_with_source["Source"] = bank_name
-
+        # Collect all dataframes with source information
+        for result in results:
+            df_with_source = result["df"].copy()
+            df_with_source["Source"] = result["bank_name"]
             all_dfs.append(df_with_source)
 
-            # Generate Excel file for this document
-            excel_buffer = io.BytesIO()
-            df.to_excel(excel_buffer, index=False, engine="openpyxl")
-            excel_bytes = excel_buffer.getvalue()
+        # Combine all dataframes
+        combined_df = pd.concat(all_dfs, ignore_index=True)
 
-            # Generate summary PDF for this document
-            summary_pdf_buffer = generate_summary_pdf(df, summary)
-            summary_pdf_bytes = summary_pdf_buffer.getvalue()
+        # Generate combined Excel
+        combined_excel_buffer = io.BytesIO()
+        combined_df.to_excel(combined_excel_buffer, index=False, engine="openpyxl")
+        zip_file.writestr(f"combined_parsed_{timestamp}.xlsx", combined_excel_buffer.getvalue())
 
-            # Use index prefix for multiple files to avoid name collisions
-            prefix = f"{i + 1}_" if len(results) > 1 else ""
-            zip_file.writestr(f"{prefix}{bank_name_slug}_parsed_{timestamp}.xlsx", excel_bytes)
-            zip_file.writestr(f"{prefix}{bank_name_slug}_summary_{timestamp}.pdf", summary_pdf_bytes)
-
-        # If multiple files, create combined outputs
-        if len(results) > 1:
-            combined_df = pd.concat(all_dfs, ignore_index=True)
-
-            # Combined Excel
-            combined_excel_buffer = io.BytesIO()
-            combined_df.to_excel(combined_excel_buffer, index=False, engine="openpyxl")
-            zip_file.writestr(f"combined_parsed_{timestamp}.xlsx", combined_excel_buffer.getvalue())
-
-            # Combined summary
-            combined_summary = calculate_summary(combined_df)
-            combined_pdf_buffer = generate_summary_pdf(combined_df, combined_summary)
-            zip_file.writestr(f"combined_summary_{timestamp}.pdf", combined_pdf_buffer.getvalue())
+        # Generate combined summary PDF
+        combined_summary = calculate_summary(combined_df)
+        combined_coverage = calculate_coverage(combined_df)
+        combined_activity = calculate_activity_volume(combined_df)
+        combined_revenue = calculate_revenue(combined_df)
+        combined_pdf_buffer = generate_summary_pdf(
+            combined_df, combined_summary, combined_coverage, combined_activity, combined_revenue
+        )
+        zip_file.writestr(f"combined_summary_{timestamp}.pdf", combined_pdf_buffer.getvalue())
 
     zip_buffer.seek(0)
-
-    zip_name = "combined_statements" if len(results) > 1 else results[0]["bank_name"].lower().replace(" ", "_") + "_statement"
 
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
         headers={
-            "Content-Disposition": f"attachment; filename={zip_name}_{timestamp}.zip"
+            "Content-Disposition": f"attachment; filename=combined_statements_{timestamp}.zip"
         },
     )
 
@@ -179,39 +175,29 @@ async def parse_statement_json(files: List[UploadFile] = File(...)):
         files: One or more PDF file uploads
 
     Returns:
-        JSON with summary and transactions.
-        For single file: returns object directly.
-        For multiple files: returns object with documents array and combined summary.
+        JSON with combined summary and transactions from all files.
     """
     # Process all files
-    results = []
     all_dfs = []
 
     for file in files:
         result = await process_single_file(file)
-        df = result["df"]
-        df_with_source = df.copy()
+        df_with_source = result["df"].copy()
         df_with_source["Source"] = result["bank_name"]
         all_dfs.append(df_with_source)
 
-        results.append({
-            "summary": result["summary"].to_dict(),
-            "transactions": df.to_dict(orient="records"),
-        })
-
-    # Single file - return simple response for backward compatibility
-    if len(results) == 1:
-        return results[0]
-
-    # Multiple files - return combined response
+    # Combine all dataframes
     combined_df = pd.concat(all_dfs, ignore_index=True)
     combined_summary = calculate_summary(combined_df)
+    coverage = calculate_coverage(combined_df)
+    activity = calculate_activity_volume(combined_df)
+    revenue = calculate_revenue(combined_df)
 
     return {
-        "documents": results,
-        "combined": {
-            "summary": combined_summary.to_dict(),
-            "transactions": combined_df.to_dict(orient="records"),
-            "document_count": len(results),
-        },
+        "summary": combined_summary.to_dict(),
+        "coverage": coverage.to_dict(),
+        "activity_volume": activity.to_dict(),
+        "revenue": revenue.to_dict(),
+        "transactions": combined_df.to_dict(orient="records"),
+        "document_count": len(files),
     }
