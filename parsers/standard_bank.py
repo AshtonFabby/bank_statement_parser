@@ -53,7 +53,13 @@ class StandardBankParser(BaseBankParser):
         )
 
     def extract_transactions(self) -> pd.DataFrame:
-        """Extract transactions from Standard Bank statement."""
+        """Extract transactions from Standard Bank statement.
+
+        Format: Date | Description | Payments | Deposits | Balance
+        - Payments are negative (debits)
+        - Deposits are positive (credits)
+        - Balance is the running balance
+        """
         rows = []
 
         for page_text in self._iterate_pages():
@@ -62,6 +68,8 @@ class StandardBankParser(BaseBankParser):
 
                 # Skip header rows
                 if "Date" in line and "Description" in line:
+                    continue
+                if "Payments" in line and "Deposits" in line:
                     continue
                 if "STATEMENT OPENING BALANCE" in line.upper():
                     continue
@@ -93,20 +101,29 @@ class StandardBankParser(BaseBankParser):
                 credit = 0.0
                 balance = clean_amount(amounts[-1])
 
+                # If 3 amounts: Payments, Deposits, Balance
                 if len(amounts) == 3:
                     payment = clean_amount(amounts[0])
                     deposit = clean_amount(amounts[1])
 
+                    # Payments are shown as negative (debits)
                     if payment < 0:
                         debit = abs(payment)
                     elif payment > 0:
+                        # If positive, it's a deposit (unusual but handle it)
                         credit = payment
 
+                    # Deposits are positive (credits)
                     if deposit > 0:
                         credit = deposit
+                    elif deposit < 0:
+                        # If negative, it's a payment (unusual but handle it)
+                        debit = abs(deposit)
 
-                elif len(amounts) >= 2:
+                # If 2 amounts: could be Payment+Balance or Deposit+Balance
+                elif len(amounts) == 2:
                     first_amount = clean_amount(amounts[0])
+                    # Negative = payment (debit), Positive = deposit (credit)
                     if first_amount < 0:
                         debit = abs(first_amount)
                     else:

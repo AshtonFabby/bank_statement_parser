@@ -46,7 +46,13 @@ class BidvestParser(BaseBankParser):
         )
 
     def extract_transactions(self) -> pd.DataFrame:
-        """Extract transactions from Bidvest Bank statement."""
+        """Extract transactions from Bidvest Bank statement.
+
+        Format: Transaction Date | Effective Date | Description | Reference | Fees | Amount | Balance
+        - Fees are shown separately (can be 0.00 or positive)
+        - Amount is negative for debits, positive for credits
+        - Balance is the running balance
+        """
         rows = []
 
         for page_text in self._iterate_pages():
@@ -55,7 +61,11 @@ class BidvestParser(BaseBankParser):
 
                 if "Transaction" in line and "Date" in line:
                     continue
+                if "Effective Date" in line or "Description" in line:
+                    continue
                 if "Balance Brought Forward" in line:
+                    continue
+                if "NEDLINK" in line and "Reference" in line:
                     continue
 
                 date_match = self.DATE_PATTERN.match(line)
@@ -76,7 +86,7 @@ class BidvestParser(BaseBankParser):
                 is_negative = ["-" in amt for amt in amounts]
 
                 rest_of_line = line[date_match.end():].strip()
-                # Skip second date if present
+                # Skip second date if present (Effective Date)
                 second_date = re.match(r"^\d{4}/\d{2}/\d{2}\s*", rest_of_line)
                 if second_date:
                     rest_of_line = rest_of_line[second_date.end():].strip()
@@ -87,24 +97,47 @@ class BidvestParser(BaseBankParser):
                 else:
                     description = rest_of_line
 
-                debit = 0.0
-                credit = 0.0
+                # Format: Description [Reference] Fees Amount Balance
+                # Balance is always last
                 balance = float(cleaned_amounts[-1]) if cleaned_amounts else 0.0
 
-                if len(cleaned_amounts) >= 2:
+                debit = 0.0
+                credit = 0.0
+
+                # If we have 3+ amounts: likely Fees, Amount, Balance
+                if len(cleaned_amounts) >= 3:
+                    # Second to last is the Amount
+                    amt_idx = -2
+                    amt_val = float(cleaned_amounts[amt_idx])
+
+                    if is_negative[amt_idx]:
+                        debit = amt_val
+                    else:
+                        credit = amt_val
+
+                    # Add fees to debit if present
+                    fees_idx = -3
+                    if fees_idx >= -len(cleaned_amounts):
+                        fees_val = float(cleaned_amounts[fees_idx])
+                        if fees_val > 0:
+                            debit += fees_val
+
+                # If we have 2 amounts: likely Amount, Balance
+                elif len(cleaned_amounts) == 2:
                     amt_val = float(cleaned_amounts[0])
                     if is_negative[0]:
                         debit = amt_val
                     else:
-                        if len(rows) > 0:
-                            prev_balance = rows[-1]["Balance"]
-                            diff = balance - prev_balance
-                            if diff < 0:
-                                debit = abs(diff)
-                            else:
-                                credit = diff
-                        else:
-                            credit = amt_val
+                        credit = amt_val
+
+                # If only 1 amount (balance), calculate from balance change
+                elif len(cleaned_amounts) == 1 and len(rows) > 0:
+                    prev_balance = rows[-1]["Balance"]
+                    diff = balance - prev_balance
+                    if diff < 0:
+                        debit = abs(diff)
+                    else:
+                        credit = diff
 
                 rows.append(create_transaction_row(date_str, description, debit, credit, balance))
 

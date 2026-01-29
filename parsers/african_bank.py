@@ -16,7 +16,7 @@ class AfricanBankParser(BaseBankParser):
     DETECTION_KEYWORDS = ["african bank", "africanbank"]
 
     DATE_PATTERN = re.compile(r"^(\d{4}/\d{2}/\d{2})")
-    AMOUNT_PATTERN = re.compile(r"-?[\d]+\.\d{2}")
+    AMOUNT_PATTERN = re.compile(r"-?[\d,]+\.\d{2}")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from African Bank statement."""
@@ -46,7 +46,11 @@ class AfricanBankParser(BaseBankParser):
         )
 
     def extract_transactions(self) -> pd.DataFrame:
-        """Extract transactions from African Bank statement."""
+        """Extract transactions from African Bank statement.
+
+        Format: TRANSACTION DATE | TRANSACTION DETAILS | BANK CHARGES | AMOUNT | BALANCE
+        Example: 2025/04/01 Credit Interest 35.76 35.41
+        """
         rows = []
 
         for page_text in self._iterate_pages():
@@ -56,6 +60,8 @@ class AfricanBankParser(BaseBankParser):
                 if "TRANSACTION DATE" in line or "TRANSACTION DETAILS" in line:
                     continue
                 if "Opening Balance" in line and "TRANSACTION" not in line:
+                    continue
+                if "BANK CHARGES" in line or "AMOUNT" in line or "BALANCE" in line:
                     continue
 
                 date_match = self.DATE_PATTERN.match(line)
@@ -75,17 +81,24 @@ class AfricanBankParser(BaseBankParser):
                 else:
                     description = rest_of_line
 
+                # African Bank format: Description [BANK_CHARGES] AMOUNT BALANCE
+                # BANK_CHARGES is optional (can be blank or negative)
+                # AMOUNT is positive for credits, negative for debits
+                # BALANCE is the running balance
+
+                balance = float(amounts[-1].replace(",", "")) if amounts else 0.0
+
                 debit = 0.0
                 credit = 0.0
-                balance = float(amounts[-1]) if amounts else 0.0
 
-                # Determine debit/credit from amount sign or balance change
+                # If we have at least 2 amounts, second to last is the transaction amount
                 if len(amounts) >= 2:
-                    amt = float(amounts[-2])
+                    amt = float(amounts[-2].replace(",", ""))
                     if amt < 0:
                         debit = abs(amt)
                     else:
                         credit = amt
+                # If only 1 amount (balance), calculate from balance change
                 elif len(rows) > 0:
                     prev_balance = rows[-1]["Balance"]
                     diff = balance - prev_balance
