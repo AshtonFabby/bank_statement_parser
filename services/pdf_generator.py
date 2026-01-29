@@ -16,14 +16,12 @@ from .summary import Summary
 def generate_summary_pdf(
     df: pd.DataFrame,
     summary: Summary,
-    account_info: dict,
 ) -> io.BytesIO:
     """Generate a summary PDF report.
 
     Args:
         df: Transaction DataFrame
         summary: Summary object with totals
-        account_info: Account information dictionary
 
     Returns:
         BytesIO buffer containing the PDF
@@ -57,36 +55,6 @@ def generate_summary_pdf(
             date_style,
         )
     )
-    elements.append(Spacer(1, 20))
-
-    # Account Information Section
-    elements.append(Paragraph("Account Information", styles["Heading2"]))
-    elements.append(Spacer(1, 10))
-
-    account_data = [
-        ["Field", "Value"],
-        ["Bank", account_info.get("bank") or "N/A"],
-        ["Account Number", account_info.get("account_number") or "N/A"],
-    ]
-
-    account_table = Table(account_data, colWidths=[2.5 * inch, 2.5 * inch])
-    account_table.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a5276")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 12),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#d4e6f1")),
-            ("GRID", (0, 0), (-1, -1), 1, colors.HexColor("#5dade2")),
-            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-            ("FONTSIZE", (0, 1), (-1, -1), 10),
-            ("TOPPADDING", (0, 1), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
-        ])
-    )
-    elements.append(account_table)
     elements.append(Spacer(1, 20))
 
     # Financial Summary Section
