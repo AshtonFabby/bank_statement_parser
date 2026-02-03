@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from parsers import SUPPORTED_BANKS, get_parser
+from parsers import SUPPORTED_BANKS, get_parser, get_parser_by_id
 from services import (
     calculate_summary,
     calculate_coverage,
@@ -80,14 +80,22 @@ async def process_single_file(file: UploadFile) -> dict:
         )
 
     contents = await file.read()
-    pdf_buffer = io.BytesIO(contents)
 
-    parser = get_parser(pdf_buffer)
+    # Detect bank type using a temporary buffer
+    detection_buffer = io.BytesIO(contents)
+    parser = get_parser(detection_buffer)
     if not parser:
         raise HTTPException(
             status_code=400,
             detail=f"Could not detect bank type for '{file.filename}'. Supported banks: {', '.join(SUPPORTED_BANKS)}",
         )
+
+    # Create a fresh buffer for parsing to avoid issues with file position
+    parsing_buffer = io.BytesIO(contents)
+
+    # Re-initialize parser with fresh buffer
+    bank_id = parser.BANK_ID
+    parser = get_parser_by_id(bank_id, parsing_buffer)
 
     try:
         account_info, df = parser.parse()

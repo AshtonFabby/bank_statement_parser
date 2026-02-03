@@ -34,6 +34,7 @@ class BaseBankParser(ABC):
 
     def __init__(self, pdf_file: io.BytesIO):
         self.pdf_file = pdf_file
+        self._reset_file()
 
     def _reset_file(self) -> None:
         """Reset file pointer to beginning."""

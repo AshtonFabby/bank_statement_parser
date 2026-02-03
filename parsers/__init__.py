@@ -18,9 +18,11 @@ from .discovery import DiscoveryParser
 from .hbz import HBZParser
 from .african_bank import AfricanBankParser
 from .tymebank import TymeBankParser
+from .hellopaisa import HelloPaisaParser
 
 # Registry of all available parsers (order matters for detection)
 PARSER_REGISTRY: list[Type[BaseBankParser]] = [
+    HelloPaisaParser,
     TymeBankParser,
     AfricanBankParser,
     HBZParser,
@@ -54,6 +56,7 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
     """
     import pdfplumber
 
+    pdf_file.seek(0)
     with pdfplumber.open(pdf_file) as pdf:
         if pdf.pages:
             first_page_text = pdf.pages[0].extract_text() or ""
@@ -113,6 +116,7 @@ __all__ = [
     "HBZParser",
     "AfricanBankParser",
     "TymeBankParser",
+    "HelloPaisaParser",
     # Registry and utilities
     "PARSER_REGISTRY",
     "PARSER_MAP",
