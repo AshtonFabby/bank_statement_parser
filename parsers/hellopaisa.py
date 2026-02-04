@@ -5,7 +5,7 @@ import re
 import pandas as pd
 
 from .base import AccountInfo, BaseBankParser
-from .utils import create_transaction_row
+from .utils import create_transaction_row, normalize_amount_string
 
 
 class HelloPaisaParser(BaseBankParser):
@@ -17,6 +17,9 @@ class HelloPaisaParser(BaseBankParser):
 
     # Date format is YYYYMMDD (e.g., 20250801)
     DATE_PATTERN = re.compile(r"^(\d{8})\s+(\d{8})\s+")
+    # Also handle single date format
+    DATE_PATTERN_SINGLE = re.compile(r"^(\d{8})\s+")
+    # Amount pattern
     AMOUNT_PATTERN = re.compile(r"[\d,]+\.\d{2}")
 
     def extract_account_info(self) -> AccountInfo:
@@ -47,10 +50,16 @@ class HelloPaisaParser(BaseBankParser):
 
     def _parse_date_yyyymmdd(self, date_str: str) -> str:
         """Convert YYYYMMDD to DD/MM/YYYY."""
+        if len(date_str) != 8:
+            return ""
         year = date_str[:4]
         month = date_str[4:6]
         day = date_str[6:8]
         return f"{day}/{month}/{year}"
+
+    def _clean_amount(self, amt: str) -> float:
+        """Clean HelloPaisa amount string to float."""
+        return normalize_amount_string(amt)
 
     def extract_transactions(self) -> pd.DataFrame:
         """Extract transactions from HelloPaisa statement.
@@ -72,35 +81,44 @@ class HelloPaisaParser(BaseBankParser):
                     continue
                 if "Effective Date" in line:
                     continue
+                if "Fee" in line and "Debit" in line and "Credit" in line:
+                    continue
 
                 # Handle BALANCE BROUGHT FORWARD (no dates)
                 if "BALANCE BROUGHT FORWARD" in line:
                     amounts = self.AMOUNT_PATTERN.findall(line)
                     if amounts:
-                        balance = float(amounts[-1].replace(",", ""))
+                        balance = self._clean_amount(amounts[-1])
                         rows.append(create_transaction_row(
                             "", "BALANCE BROUGHT FORWARD", 0.0, 0.0, balance
                         ))
                     continue
 
-                # Look for lines starting with date pattern YYYYMMDD YYYYMMDD
+                # Try matching two dates first: YYYYMMDD YYYYMMDD
                 date_match = self.DATE_PATTERN.match(line)
-                if not date_match:
+                if date_match:
+                    trans_date = date_match.group(1)
+                    date_str = self._parse_date_yyyymmdd(trans_date)
+                    rest_of_line = line[date_match.end():].strip()
+                else:
+                    # Try single date
+                    date_match = self.DATE_PATTERN_SINGLE.match(line)
+                    if not date_match:
+                        continue
+                    trans_date = date_match.group(1)
+                    date_str = self._parse_date_yyyymmdd(trans_date)
+                    rest_of_line = line[date_match.end():].strip()
+
+                if not date_str:
                     continue
-
-                trans_date = date_match.group(1)
-                date_str = self._parse_date_yyyymmdd(trans_date)
-
-                # Get the rest of the line after the two dates
-                rest_of_line = line[date_match.end():].strip()
 
                 # Find all amounts in the line
                 amounts = self.AMOUNT_PATTERN.findall(rest_of_line)
                 if len(amounts) < 1:
                     continue
 
-                # Clean amounts (remove commas)
-                cleaned_amounts = [float(amt.replace(",", "")) for amt in amounts]
+                # Clean amounts
+                cleaned_amounts = [self._clean_amount(amt) for amt in amounts]
 
                 # Extract description (text before first amount)
                 first_amt_match = self.AMOUNT_PATTERN.search(rest_of_line)
@@ -110,31 +128,40 @@ class HelloPaisaParser(BaseBankParser):
                     description = rest_of_line
 
                 # Format: Description | Fee | Debit | Credit | Balance
-                # We expect 4 amounts: Fee, Debit, Credit, Balance
+                # We expect up to 4 amounts: Fee, Debit, Credit, Balance
                 fee = 0.0
                 debit = 0.0
                 credit = 0.0
                 balance = 0.0
 
                 if len(cleaned_amounts) >= 4:
+                    # Full format: Fee, Debit, Credit, Balance
                     fee = cleaned_amounts[-4]
                     debit = cleaned_amounts[-3]
                     credit = cleaned_amounts[-2]
                     balance = cleaned_amounts[-1]
                 elif len(cleaned_amounts) == 3:
-                    # Might be missing fee column
+                    # Might be missing fee column: Debit, Credit, Balance
                     debit = cleaned_amounts[-3]
                     credit = cleaned_amounts[-2]
                     balance = cleaned_amounts[-1]
                 elif len(cleaned_amounts) == 2:
-                    # Just debit/credit and balance
+                    # Just amount and balance
+                    balance = cleaned_amounts[-1]
                     if rows:
                         prev_balance = rows[-1]["Balance"]
-                        if cleaned_amounts[-1] < prev_balance:
+                        diff = balance - prev_balance
+                        if diff < 0:
                             debit = cleaned_amounts[0]
                         else:
                             credit = cleaned_amounts[0]
-                    balance = cleaned_amounts[-1]
+                    else:
+                        # First transaction - check description for hints
+                        desc_lower = description.lower()
+                        if any(w in desc_lower for w in ["deposit", "credit", "received", "transfer in"]):
+                            credit = cleaned_amounts[0]
+                        else:
+                            debit = cleaned_amounts[0]
                 elif len(cleaned_amounts) == 1:
                     balance = cleaned_amounts[0]
                     # Calculate from balance change

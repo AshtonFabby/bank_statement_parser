@@ -2,13 +2,16 @@
 
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Tuple
 
 # Common month mapping
 MONTH_MAP = {
     "jan": "01", "feb": "02", "mar": "03", "apr": "04",
     "may": "05", "jun": "06", "jul": "07", "aug": "08",
     "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+    "january": "01", "february": "02", "march": "03", "april": "04",
+    "june": "06", "july": "07", "august": "08",
+    "september": "09", "october": "10", "november": "11", "december": "12",
 }
 
 # Common regex patterns
@@ -17,6 +20,7 @@ PATTERNS = {
     "date_dd_mm_yyyy": re.compile(r"(\d{2}/\d{2}/\d{4})"),
     "date_d_mm_yyyy": re.compile(r"(\d{1,2}/\d{1,2}/\d{4})"),
     "date_yyyy_mm_dd": re.compile(r"(\d{4}/\d{2}/\d{2})"),
+    "date_yyyy_mm_dd_dash": re.compile(r"(\d{4})-(\d{2})-(\d{2})"),
     "date_dd_mmm_yy": re.compile(
         r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})\b",
         re.IGNORECASE
@@ -34,12 +38,83 @@ PATTERNS = {
         re.IGNORECASE
     ),
 
-    # Amount patterns
+    # Amount patterns - comprehensive versions
     "amount_standard": re.compile(r"-?[\d,]+\.\d{2}"),
     "amount_with_spaces": re.compile(r"-?\s*[\d\s]+\.\d{2}"),
     "amount_with_cr": re.compile(r"-?[\d,]+\.\d{2}(?:Cr)?"),
-    "amount_with_r_prefix": re.compile(r"-?\s*R?\s*[\d\s]+\.\d{2}"),
+    "amount_with_r_prefix": re.compile(r"-?\s*R?\s*[\d\s,]+\.\d{2}-?"),
+    # Handles: R 10,274.00, -R980.44, R 983.08-, - R2.75, etc.
+    "amount_south_african": re.compile(r"-?\s*R?\s*[\d\s,]+\.\d{2}-?"),
 }
+
+
+def normalize_amount_string(amount_str: str) -> float:
+    """Normalize any South African bank amount format to a float.
+
+    Handles formats like:
+    - "1,234.56"
+    - "1 234.56" (space as thousands separator)
+    - "-1,234.56"
+    - "R 1,234.56"
+    - "- R 1,234.56"
+    - "R 1,234.56-" (trailing minus)
+    - "+1,234.56"
+
+    Args:
+        amount_str: Raw amount string from PDF
+
+    Returns:
+        Float value, negative if debit
+    """
+    if not amount_str:
+        return 0.0
+
+    original = amount_str.strip()
+
+    # Determine sign
+    is_negative = False
+    if original.startswith("-") or original.startswith("- "):
+        is_negative = True
+    elif original.endswith("-"):
+        is_negative = True
+    elif original.startswith("+"):
+        is_negative = False
+
+    # Clean the string
+    clean = original
+    clean = clean.replace("R", "").replace("r", "")
+    clean = clean.replace("-", "").replace("+", "")
+    clean = clean.replace(" ", "")  # Remove spaces (thousands separator)
+    clean = clean.replace(",", "")  # Remove commas (thousands separator)
+    clean = clean.strip()
+
+    try:
+        value = float(clean)
+        return -value if is_negative else value
+    except ValueError:
+        return 0.0
+
+
+def extract_amounts_from_line(line: str, min_decimals: int = 2) -> List[Tuple[str, float, int]]:
+    """Extract all amount patterns from a line with their positions.
+
+    Returns list of tuples: (raw_string, float_value, start_position)
+    """
+    # Pattern to match various amount formats
+    # Handles: 1,234.56, 1 234.56, -1234.56, R 1,234.56, R1234.56-, etc.
+    amount_pattern = re.compile(
+        r'(-?\s*R?\s*[\d\s,]+\.\d{2})-?|'  # Standard with optional R and trailing minus
+        r'([+-]?\d{1,3}(?:[ ,]\d{3})*\.\d{2})'  # Space or comma separated
+    )
+
+    results = []
+    for match in amount_pattern.finditer(line):
+        raw = match.group(0)
+        value = normalize_amount_string(raw)
+        if value != 0.0 or raw.strip() == "0.00":
+            results.append((raw, value, match.start()))
+
+    return results
 
 
 def parse_date_dd_mm_yyyy(date_str: str) -> str:

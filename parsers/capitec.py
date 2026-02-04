@@ -5,7 +5,7 @@ import re
 import pandas as pd
 
 from .base import AccountInfo, BaseBankParser
-from .utils import PATTERNS, clean_amount, create_transaction_row
+from .utils import PATTERNS, create_transaction_row, normalize_amount_string
 
 
 class CapitecParser(BaseBankParser):
@@ -16,8 +16,8 @@ class CapitecParser(BaseBankParser):
     DETECTION_KEYWORDS = ["capitec"]
 
     # Capitec-specific amount pattern: -1 234.56 or +1 234.56 or 1 234.56
-    # Also handles fees with one decimal place like -6.0
-    AMOUNT_PATTERN = re.compile(r"[+-]?\d{1,3}(?: \d{3})*\.\d{1,2}")
+    # Also handles fees with one decimal place like -6.0 or -6.00
+    AMOUNT_PATTERN = re.compile(r"[+-]?\d{1,3}(?:[ ,]\d{3})*\.\d{1,2}")
     # Also support comma-separated format
     AMOUNT_PATTERN_COMMA = re.compile(r"[+-]?[\d,]+\.\d{1,2}")
     # Date patterns
@@ -71,6 +71,10 @@ class CapitecParser(BaseBankParser):
             return f"{parts[0]}/{parts[1]}/{full_year}"
         return date_str
 
+    def _clean_amount(self, amount_str: str) -> float:
+        """Clean Capitec amount string to float."""
+        return normalize_amount_string(amount_str)
+
     def _parse_business_format(self, page_text: str, rows: list) -> None:
         """Parse business account format.
 
@@ -89,12 +93,18 @@ class CapitecParser(BaseBankParser):
             if "Transaction history" in line:
                 continue
 
-            # Handle "Balance brought forward"
-            if "balance brought forward" in line.lower():
+            # Handle "Balance brought forward" - can have different formats
+            if "balance brought forward" in line.lower() or "balance b/forward" in line.lower():
                 amounts = self.AMOUNT_PATTERN.findall(line)
+                if not amounts:
+                    amounts = self.AMOUNT_PATTERN_COMMA.findall(line)
                 if amounts:
-                    balance = clean_amount(amounts[-1])
+                    balance = self._clean_amount(amounts[-1])
                     rows.append(create_transaction_row("", "Balance brought forward", 0.0, 0.0, balance))
+                continue
+
+            # Handle "Interest Rate" line - skip
+            if "interest rate" in line.lower():
                 continue
 
             # Check for business format: DD/MM/YY DD/MM/YY ...
@@ -109,10 +119,14 @@ class CapitecParser(BaseBankParser):
             # Find all amounts in the line
             amounts = self.AMOUNT_PATTERN.findall(rest_of_line)
             if not amounts:
+                amounts = self.AMOUNT_PATTERN_COMMA.findall(rest_of_line)
+            if not amounts:
                 continue
 
             # Extract description (text before first amount)
             first_amt_match = self.AMOUNT_PATTERN.search(rest_of_line)
+            if not first_amt_match:
+                first_amt_match = self.AMOUNT_PATTERN_COMMA.search(rest_of_line)
             if first_amt_match:
                 description = rest_of_line[:first_amt_match.start()].strip()
             else:
@@ -120,7 +134,7 @@ class CapitecParser(BaseBankParser):
 
             # Parse amounts - Format: [Fees] Amount Balance
             # Balance is always last
-            balance = clean_amount(amounts[-1])
+            balance = self._clean_amount(amounts[-1])
             debit = 0.0
             credit = 0.0
             fees = 0.0
@@ -130,8 +144,8 @@ class CapitecParser(BaseBankParser):
                 fees_str = amounts[-3]
                 amount_str = amounts[-2]
 
-                fees = abs(clean_amount(fees_str))
-                amount_val = clean_amount(amount_str)
+                fees = abs(self._clean_amount(fees_str))
+                amount_val = self._clean_amount(amount_str)
 
                 if amount_str.startswith("+") or (not amount_str.startswith("-") and amount_val > 0):
                     credit = abs(amount_val)
@@ -144,7 +158,7 @@ class CapitecParser(BaseBankParser):
             elif len(amounts) >= 2:
                 # Amount, Balance
                 amount_str = amounts[-2]
-                amount_val = clean_amount(amount_str)
+                amount_val = self._clean_amount(amount_str)
 
                 if amount_str.startswith("+"):
                     credit = abs(amount_val)
@@ -158,6 +172,12 @@ class CapitecParser(BaseBankParser):
                         debit = abs(diff)
                     else:
                         credit = diff
+                else:
+                    # First transaction - check if amount is positive or negative
+                    if amount_val < 0:
+                        debit = abs(amount_val)
+                    else:
+                        credit = amount_val
 
             elif len(amounts) == 1 and rows:
                 # Just balance, calculate from previous
@@ -174,6 +194,7 @@ class CapitecParser(BaseBankParser):
         """Parse standard personal account format.
 
         Format: Date | Description | Reference | Money in | Money out | Fees | Balance
+        Also handles newer format with different column structures.
         """
         for line in page_text.split("\n"):
             line = line.strip()
@@ -186,10 +207,22 @@ class CapitecParser(BaseBankParser):
             if "Transaction history" in line:
                 continue
 
-            # Standard format: DD/MM/YYYY
-            if not self.DATE_PATTERN_FULL.match(line):
+            # Handle Opening balance
+            if "opening balance" in line.lower():
+                amounts = self.AMOUNT_PATTERN.findall(line)
+                if not amounts:
+                    amounts = self.AMOUNT_PATTERN_COMMA.findall(line)
+                if amounts:
+                    balance = self._clean_amount(amounts[-1])
+                    rows.append(create_transaction_row("", "Opening Balance", 0.0, 0.0, balance))
                 continue
 
+            # Standard format: DD/MM/YYYY
+            date_match = self.DATE_PATTERN_FULL.match(line)
+            if not date_match:
+                continue
+
+            # Find all amounts in line
             amounts = self.AMOUNT_PATTERN.findall(line)
             if len(amounts) < 2:
                 amounts = self.AMOUNT_PATTERN_COMMA.findall(line)
@@ -199,21 +232,23 @@ class CapitecParser(BaseBankParser):
 
             date = line[:10]
 
-            # Get description
-            first_amt_match = re.search(r"[+-]?[\d,\s]+\.\d{2}", line[11:])
+            # Get description (text between date and first amount)
+            rest_of_line = line[11:].strip()
+            first_amt_match = re.search(r"[+-]?[\d,\s]+\.\d{2}", rest_of_line)
             if first_amt_match:
-                description = line[11:11+first_amt_match.start()].strip()
+                description = rest_of_line[:first_amt_match.start()].strip()
             else:
-                description = line[11:].strip()
+                description = rest_of_line
 
-            balance = clean_amount(amounts[-1])
+            balance = self._clean_amount(amounts[-1])
             debit = 0.0
             credit = 0.0
 
             if len(amounts) >= 4:
-                money_in = clean_amount(amounts[-4])
-                money_out = clean_amount(amounts[-3])
-                fees = clean_amount(amounts[-2])
+                # Full format: Money in, Money out, Fees, Balance
+                money_in = self._clean_amount(amounts[-4])
+                money_out = self._clean_amount(amounts[-3])
+                fees = self._clean_amount(amounts[-2])
 
                 if money_in > 0:
                     credit = money_in
@@ -223,18 +258,21 @@ class CapitecParser(BaseBankParser):
                     debit += fees
 
             elif len(amounts) == 3:
-                first_amt = clean_amount(amounts[0])
-                second_amt = clean_amount(amounts[1])
+                # Could be: Amount, Fees, Balance or Money in, Money out, Balance
+                first_amt = self._clean_amount(amounts[0])
+                second_amt = self._clean_amount(amounts[1])
 
                 if first_amt < 0:
                     debit = abs(first_amt)
                     if second_amt > 0 and second_amt < abs(first_amt):
-                        debit += second_amt
+                        debit += second_amt  # Fees
                 elif first_amt > 0:
                     credit = first_amt
+                    if second_amt < 0:
+                        debit = abs(second_amt)
 
             elif len(amounts) == 2:
-                txn_amount = clean_amount(amounts[0])
+                txn_amount = self._clean_amount(amounts[0])
 
                 if txn_amount < 0:
                     debit = abs(txn_amount)

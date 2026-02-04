@@ -10,7 +10,7 @@ from .utils import (
     MONTH_MAP,
     create_transaction_row,
     extract_year_from_text,
-    parse_amount_with_cr,
+    normalize_amount_string,
 )
 
 
@@ -34,7 +34,9 @@ class FNBParser(BaseBankParser):
     # Transaction History amounts: with CR/DR suffix
     AMOUNT_PATTERN_CR_DR = re.compile(r"[\d,]+\.\d{2}\s*(?:CR|DR)", re.IGNORECASE)
     # Bank Statement amounts: plain numbers
-    AMOUNT_PATTERN_PLAIN = re.compile(r"[\d,]+\.?\d*")
+    AMOUNT_PATTERN_PLAIN = re.compile(r"[\d,]+\.\d{2}")
+    # Amount pattern with Cr suffix (for some formats)
+    AMOUNT_PATTERN_CR = re.compile(r"[\d,]+\.\d{2}Cr", re.IGNORECASE)
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from FNB statement."""
@@ -49,14 +51,7 @@ class FNBParser(BaseBankParser):
         if selected_account_match:
             account_number = selected_account_match.group(1).strip()
 
-        # Look for Nickname field to use as account type
-        nickname_match = re.search(
-            r"Nickname\s*[:\s]+([\w\s]+?)(?:\n|Selected)", full_text, re.IGNORECASE
-        )
-        if nickname_match:
-            account_type = nickname_match.group(1).strip()
-
-        # Fallback: look for "Gold Business Account : 63169152360" pattern
+        # Look for "Gold Business Account : 62765962941" pattern
         if not account_number:
             account_match = re.search(
                 r"([\w\s]+Account)\s*[:\s]+(\d{10,12})", full_text
@@ -64,6 +59,14 @@ class FNBParser(BaseBankParser):
             if account_match:
                 account_type = account_match.group(1).strip()
                 account_number = account_match.group(2).strip()
+
+        # Look for Nickname field to use as account type
+        if not account_type:
+            nickname_match = re.search(
+                r"Nickname\s*[:\s]+([\w\s]+?)(?:\n|Selected)", full_text, re.IGNORECASE
+            )
+            if nickname_match:
+                account_type = nickname_match.group(1).strip()
 
         # Fallback: look for Account Number field
         if not account_number:
@@ -78,6 +81,10 @@ class FNBParser(BaseBankParser):
             account_number=account_number,
             account_type=account_type,
         )
+
+    def _clean_amount(self, amt: str) -> float:
+        """Clean FNB amount string to float."""
+        return normalize_amount_string(amt)
 
     def extract_transactions(self) -> pd.DataFrame:
         """Extract transactions from FNB statement.
@@ -99,11 +106,24 @@ class FNBParser(BaseBankParser):
                 line = line.strip()
 
                 # Skip header rows
+                if not line:
+                    continue
                 if "Date" in line and "Description" in line:
                     continue
                 if "Balance" in line and "Amount" in line:
                     continue
-                if "Service Fee" in line:
+                if "Service Fee" in line and "Closing Balance" in line:
+                    continue
+
+                # Handle Opening/Statement Balance
+                if "opening balance" in line.lower() or "statement balance" in line.lower():
+                    amounts = self.AMOUNT_PATTERN_PLAIN.findall(line)
+                    if amounts:
+                        balance = self._clean_amount(amounts[-1])
+                        rows.append(create_transaction_row(
+                            "", "Opening Balance", 0.0, 0.0, balance
+                        ))
+                        previous_balance = balance
                     continue
 
                 # Try matching with year first (Transaction History format)
@@ -140,6 +160,7 @@ class FNBParser(BaseBankParser):
                     row = self._parse_transaction_history_line(rest_of_line, date_str)
                     if row:
                         rows.append(row)
+                        previous_balance = row["Balance"]
                 else:
                     # Bank Statement format with plain amounts
                     row = self._parse_bank_statement_line(rest_of_line, date_str, previous_balance)
@@ -192,55 +213,67 @@ class FNBParser(BaseBankParser):
         """Parse a line from Bank Statement format (plain amounts).
 
         Format: Description Amount Balance Accrued_Bank_Charges
-        Example: ADT Cash Deposit 00072011 A005 Thanda Mnyama 800,000 391,101.83
+        Example: ADT Cash Deposit 00072011 A005 Thanda Mnyama 800.00Cr 391,101.63
         """
+        # Check for Cr suffix amounts first
+        cr_amounts = self.AMOUNT_PATTERN_CR.findall(rest_of_line)
+
         # Find all plain amounts
         amounts = self.AMOUNT_PATTERN_PLAIN.findall(rest_of_line)
 
         # Filter out very small amounts that might be part of reference numbers
-        amounts = [a for a in amounts if '.' in a or len(a) >= 3]
+        amounts = [a for a in amounts if '.' in a and len(a.replace(',', '').replace('.', '')) >= 3]
 
         if len(amounts) < 2:
             return None
 
         # Extract description (everything before the first amount)
-        first_amount_match = re.search(r"[\d,]+\.?\d+", rest_of_line)
+        first_amount_match = re.search(r"[\d,]+\.?\d*Cr|[\d,]+\.\d{2}", rest_of_line)
         if first_amount_match:
             description = rest_of_line[:first_amount_match.start()].strip()
         else:
             return None
 
-        # The last amount is usually Balance, second-to-last is Amount
-        balance = float(amounts[-1].replace(",", ""))
-        amount = float(amounts[-2].replace(",", ""))
+        # The last amount is usually Balance
+        balance = self._clean_amount(amounts[-1])
 
-        # Determine debit/credit from balance change
-        if previous_balance is not None:
-            diff = balance - previous_balance
-            if abs(diff - amount) < 0.01:
-                # Positive change = credit
-                credit = amount
-                debit = 0.0
-            elif abs(diff + amount) < 0.01:
-                # Negative change = debit
-                debit = amount
-                credit = 0.0
-            else:
-                # Fallback: if balance increased, it's credit
-                if diff > 0:
+        # Determine debit/credit
+        debit = 0.0
+        credit = 0.0
+
+        # Check if the transaction amount has Cr suffix
+        if cr_amounts:
+            # Has Cr suffix = credit
+            amount = self._clean_amount(cr_amounts[0].replace('Cr', '').replace('cr', ''))
+            credit = amount
+        elif len(amounts) >= 2:
+            amount = self._clean_amount(amounts[-2])
+
+            # Determine debit/credit from balance change
+            if previous_balance is not None:
+                diff = balance - previous_balance
+                if abs(diff - amount) < 0.01:
+                    # Positive change = credit
                     credit = amount
-                    debit = 0.0
-                else:
+                elif abs(diff + amount) < 0.01:
+                    # Negative change = debit
                     debit = amount
-                    credit = 0.0
-        else:
-            # First transaction: assume amount matches direction of balance
-            if balance > 0:
-                credit = amount
-                debit = 0.0
+                else:
+                    # Fallback: if balance increased, it's credit
+                    if diff > 0:
+                        credit = amount
+                    else:
+                        debit = amount
             else:
-                debit = amount
-                credit = 0.0
+                # First transaction: check description for hints
+                desc_lower = description.lower()
+                if any(w in desc_lower for w in ["deposit", "credit", "payment received", "transfer in"]):
+                    credit = amount
+                elif any(w in desc_lower for w in ["fee", "charge", "withdrawal", "payment", "purchase"]):
+                    debit = amount
+                else:
+                    # Default to debit
+                    debit = amount
 
         return create_transaction_row(date_str, description, debit, credit, balance)
 
