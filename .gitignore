@@ -26,3 +26,6 @@ htmlcov/
 .vscode/
 .idea/
 *.swp
+
+#files
+/bank_statement

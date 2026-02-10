@@ -3,6 +3,7 @@
 import re
 
 import pandas as pd
+import pdfplumber
 
 from .base import AccountInfo, BaseBankParser
 from .utils import PATTERNS, create_transaction_row, normalize_amount_string
@@ -25,6 +26,8 @@ class CapitecParser(BaseBankParser):
     DATE_PATTERN_SHORT = re.compile(r"^(\d{2}/\d{2}/\d{2})")  # DD/MM/YY
     # Business format: two dates at start (Post Date, Trans Date)
     BUSINESS_DATE_PATTERN = re.compile(r"^(\d{2}/\d{2}/\d{2})\s+(\d{2}/\d{2}/\d{2})\s+")
+    # Single short date pattern for table cell matching
+    SHORT_DATE_CELL = re.compile(r"^\d{2}/\d{2}/\d{2}$")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Capitec statement."""
@@ -75,8 +78,184 @@ class CapitecParser(BaseBankParser):
         """Clean Capitec amount string to float."""
         return normalize_amount_string(amount_str)
 
+    def _parse_cell_amount(self, cell: str) -> float:
+        """Parse an amount from a table cell, handling None and empty values."""
+        if not cell or not cell.strip():
+            return 0.0
+        cell = cell.strip()
+        # Find amount pattern in the cell
+        match = self.AMOUNT_PATTERN.search(cell)
+        if not match:
+            match = self.AMOUNT_PATTERN_COMMA.search(cell)
+        if match:
+            return self._clean_amount(match.group())
+        return 0.0
+
+    def _find_table_column_indices(self, header_row: list) -> dict:
+        """Identify column indices from the header row, handling merged/None columns.
+
+        Returns dict with keys: post_date, trans_date, description, reference, fees, amount, balance
+        """
+        indices = {}
+        clean = [(i, (c.strip().lower().replace("\n", " ") if c else "")) for i, c in enumerate(header_row)]
+
+        for i, val in clean:
+            if "post" in val and "date" in val:
+                indices["post_date"] = i
+            elif "trans" in val and "date" in val:
+                indices["trans_date"] = i
+            elif "description" in val:
+                indices["description"] = i
+            elif "reference" in val:
+                indices["reference"] = i
+            elif val == "fees":
+                indices["fees"] = i
+            elif val == "amount":
+                indices["amount"] = i
+            elif val == "balance":
+                indices["balance"] = i
+
+        return indices
+
+    def _parse_business_format_table(self, page, rows: list) -> bool:
+        """Parse business account format using pdfplumber table extraction.
+
+        Uses structured table extraction for bordered tables.
+        Dynamically detects column layout from header row.
+
+        Returns:
+            True if table extraction succeeded and found data, False otherwise.
+        """
+        tables = page.extract_tables()
+        if not tables:
+            return False
+
+        found_data = False
+        for table in tables:
+            # Detect column layout from header row
+            col_map = {}
+            for row_cells in table:
+                if not row_cells:
+                    continue
+                combined = " ".join((c or "") for c in row_cells).lower()
+                if "post" in combined and "date" in combined and "balance" in combined:
+                    col_map = self._find_table_column_indices(row_cells)
+                    break
+
+            # If no header found, skip this table
+            if not col_map:
+                continue
+
+            # Get column indices with fallbacks
+            desc_idx = col_map.get("description")
+            ref_idx = col_map.get("reference")
+            fees_idx = col_map.get("fees")
+            amount_idx = col_map.get("amount")
+            balance_idx = col_map.get("balance")
+            post_date_idx = col_map.get("post_date", 0)
+
+            for row_cells in table:
+                if not row_cells or all(not c or not c.strip() for c in row_cells):
+                    continue
+
+                # Clean cells
+                cells = [c.strip() if c else "" for c in row_cells]
+                combined = " ".join(cells).lower()
+
+                # Skip header rows
+                if "post" in combined and "date" in combined:
+                    continue
+                if "no limit" in combined or "overdraft" in combined:
+                    continue
+
+                # Handle "Balance brought forward"
+                if "balance brought forward" in combined or "balance b/forward" in combined:
+                    if balance_idx is not None and balance_idx < len(cells):
+                        balance = self._parse_cell_amount(cells[balance_idx])
+                    else:
+                        # Find balance in last non-empty cell
+                        balance = 0.0
+                        for c in reversed(cells):
+                            if c:
+                                balance = self._parse_cell_amount(c)
+                                if balance != 0.0:
+                                    break
+                    if balance != 0.0:
+                        rows.append(create_transaction_row(
+                            "", "Balance brought forward", 0.0, 0.0, balance
+                        ))
+                        found_data = True
+                    continue
+
+                # Skip interest rate lines
+                if "interest rate" in combined:
+                    continue
+
+                # Check if post date cell is a date (DD/MM/YY)
+                post_date_cell = cells[post_date_idx] if post_date_idx < len(cells) else ""
+                if not post_date_cell or not self.SHORT_DATE_CELL.match(post_date_cell):
+                    continue
+
+                date_str = self._convert_short_year(post_date_cell)
+
+                # Build description from description and reference columns
+                description_parts = []
+                if desc_idx is not None and desc_idx < len(cells) and cells[desc_idx]:
+                    description_parts.append(cells[desc_idx])
+                if ref_idx is not None and ref_idx < len(cells) and cells[ref_idx]:
+                    # Replace newlines in multi-line references
+                    description_parts.append(cells[ref_idx].replace("\n", " "))
+                description = " ".join(description_parts).strip()
+
+                # Parse fees, amount, balance
+                fees = 0.0
+                amount_val = 0.0
+                amount_str = ""
+                balance = 0.0
+
+                if fees_idx is not None and fees_idx < len(cells):
+                    fees = abs(self._parse_cell_amount(cells[fees_idx]))
+                if amount_idx is not None and amount_idx < len(cells):
+                    amount_str = cells[amount_idx]
+                    amount_val = self._parse_cell_amount(cells[amount_idx])
+                if balance_idx is not None and balance_idx < len(cells):
+                    balance = self._parse_cell_amount(cells[balance_idx])
+
+                # Determine debit/credit
+                debit = 0.0
+                credit = 0.0
+
+                if amount_str.startswith("+"):
+                    credit = abs(amount_val)
+                elif amount_str.startswith("-") or amount_val < 0:
+                    debit = abs(amount_val)
+                elif amount_val != 0.0 and rows:
+                    # Determine from balance change
+                    prev_balance = rows[-1]["Balance"]
+                    if balance > prev_balance:
+                        credit = abs(amount_val)
+                    else:
+                        debit = abs(amount_val)
+
+                if fees > 0:
+                    debit += fees
+
+                # If no amount found but we have balance, calculate from previous
+                if amount_val == 0.0 and balance != 0.0 and rows:
+                    prev_balance = rows[-1]["Balance"]
+                    diff = balance - prev_balance
+                    if diff < 0:
+                        debit = abs(diff)
+                    else:
+                        credit = diff
+
+                rows.append(create_transaction_row(date_str, description, debit, credit, balance))
+                found_data = True
+
+        return found_data
+
     def _parse_business_format(self, page_text: str, rows: list) -> None:
-        """Parse business account format.
+        """Parse business account format from extracted text.
 
         Format: Post Date | Trans Date | Description | Reference | Fees | Amount | Balance
         - Fees column (negative values like -6.0)
@@ -86,7 +265,7 @@ class CapitecParser(BaseBankParser):
             line = line.strip()
 
             # Skip headers
-            if not line or "Post" in line and "Date" in line:
+            if not line or ("Post" in line and "Date" in line):
                 continue
             if "Description" in line and "Reference" in line:
                 continue
@@ -291,15 +470,33 @@ class CapitecParser(BaseBankParser):
     def _detect_format(self) -> str:
         """Detect statement format (business vs standard)."""
         first_page = self._extract_first_page_text()
+        first_page_lower = first_page.lower()
 
         # Business format indicators
-        if "Business Account" in first_page:
+        if "business account" in first_page_lower:
             return "business"
-        if "Post Date" in first_page and "Trans" in first_page:
+        if "post date" in first_page_lower and "trans" in first_page_lower:
             return "business"
         # Check for DD/MM/YY DD/MM/YY pattern (two short dates)
         if self.BUSINESS_DATE_PATTERN.search(first_page):
             return "business"
+
+        # Also check table content for business format indicators
+        try:
+            with pdfplumber.open(self.pdf_file) as pdf:
+                if pdf.pages:
+                    tables = pdf.pages[0].extract_tables()
+                    if tables:
+                        for table in tables:
+                            for row in table:
+                                if row:
+                                    combined = " ".join(c for c in row if c).lower()
+                                    if "post" in combined and "date" in combined:
+                                        self._reset_file()
+                                        return "business"
+            self._reset_file()
+        except Exception:
+            self._reset_file()
 
         return "standard"
 
@@ -313,10 +510,18 @@ class CapitecParser(BaseBankParser):
         rows = []
         statement_format = self._detect_format()
 
-        for page_text in self._iterate_pages():
-            if statement_format == "business":
-                self._parse_business_format(page_text, rows)
-            else:
+        if statement_format == "business":
+            # Try table extraction first (works better for bordered tables)
+            with pdfplumber.open(self.pdf_file) as pdf:
+                for page in pdf.pages:
+                    if not self._parse_business_format_table(page, rows):
+                        # Fall back to text-based parsing
+                        text = page.extract_text()
+                        if text:
+                            self._parse_business_format(text, rows)
+            self._reset_file()
+        else:
+            for page_text in self._iterate_pages():
                 self._parse_standard_format(page_text, rows)
 
         return pd.DataFrame(rows)

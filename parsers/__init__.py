@@ -21,6 +21,8 @@ from .tymebank import TymeBankParser
 from .hellopaisa import HelloPaisaParser
 
 # Registry of all available parsers (order matters for detection)
+# More specific keywords should come first; generic ones (e.g. "fnb") last
+# to avoid false positives from transaction references.
 PARSER_REGISTRY: list[Type[BaseBankParser]] = [
     HelloPaisaParser,
     TymeBankParser,
@@ -32,8 +34,8 @@ PARSER_REGISTRY: list[Type[BaseBankParser]] = [
     ABSAParser,
     NedbankParser,
     StandardBankParser,
-    FNBParser,
     CapitecParser,
+    FNBParser,
 ]
 
 # Map of bank IDs to parser classes
