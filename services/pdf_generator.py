@@ -201,53 +201,268 @@ def generate_summary_pdf(
         elements.append(revenue_table)
         elements.append(Spacer(1, 30))
 
-    # Transactions Section
-    elements.append(Paragraph("Transactions", styles["Heading2"]))
+    # Top 15 Credits Section
+    elements.append(Paragraph("Top 15 Credits", styles["Heading2"]))
     elements.append(Spacer(1, 10))
 
     if not df.empty:
-        txn_data = [["Date", "Description", "Debit", "Credit", "Balance"]]
+        # Get top 15 credits sorted by amount descending
+        credits_df = df[df["Credit"] > 0].nlargest(15, "Credit")
+
+        if not credits_df.empty:
+            credit_data = [["Date", "Description", "Amount"]]
+            for _, row in credits_df.iterrows():
+                description = str(row["Description"])
+                if len(description) > 40:
+                    description = description[:40] + "..."
+                credit_data.append([
+                    row["Date"],
+                    description,
+                    f"R{row['Credit']:,.2f}",
+                ])
+
+            credit_table = Table(
+                credit_data,
+                colWidths=[1 * inch, 3.5 * inch, 1.5 * inch],
+            )
+            credit_table.setStyle(
+                TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#27ae60")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("ALIGN", (1, 1), (1, -1), "LEFT"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+                    ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
+                    ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                    ("FONTSIZE", (0, 1), (-1, -1), 8),
+                    ("TOPPADDING", (0, 1), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+                    (
+                        "ROWBACKGROUNDS",
+                        (0, 1),
+                        (-1, -1),
+                        [colors.white, colors.HexColor("#e8f5e9")],
+                    ),
+                ])
+            )
+            elements.append(credit_table)
+        else:
+            elements.append(Paragraph("No credit transactions found.", styles["Normal"]))
+
+    elements.append(Spacer(1, 30))
+
+    # Top 15 Debits Section
+    elements.append(Paragraph("Top 15 Debits", styles["Heading2"]))
+    elements.append(Spacer(1, 10))
+
+    if not df.empty:
+        # Get top 15 debits sorted by amount descending
+        debits_df = df[df["Debit"] > 0].nlargest(15, "Debit")
+
+        if not debits_df.empty:
+            debit_data = [["Date", "Description", "Amount"]]
+            for _, row in debits_df.iterrows():
+                description = str(row["Description"])
+                if len(description) > 40:
+                    description = description[:40] + "..."
+                debit_data.append([
+                    row["Date"],
+                    description,
+                    f"R{row['Debit']:,.2f}",
+                ])
+
+            debit_table = Table(
+                debit_data,
+                colWidths=[1 * inch, 3.5 * inch, 1.5 * inch],
+            )
+            debit_table.setStyle(
+                TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#c0392b")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("ALIGN", (1, 1), (1, -1), "LEFT"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+                    ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
+                    ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                    ("FONTSIZE", (0, 1), (-1, -1), 8),
+                    ("TOPPADDING", (0, 1), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+                    (
+                        "ROWBACKGROUNDS",
+                        (0, 1),
+                        (-1, -1),
+                        [colors.white, colors.HexColor("#ffebee")],
+                    ),
+                ])
+            )
+            elements.append(debit_table)
+        else:
+            elements.append(Paragraph("No debit transactions found.", styles["Normal"]))
+
+    # Existing Facilities Detection Section
+    elements.append(Spacer(1, 30))
+    elements.append(Paragraph("Existing Facilities Detected", styles["Heading2"]))
+    elements.append(Spacer(1, 10))
+
+    facility_keywords = {
+        "Retail Capital": "Retail Capital",
+        "Pollen Finance": "pm8+PolFin",
+        "Cashflow Capital": "pm8@cfc",
+        "Business Fuel": "Bfuel",
+        "Growise": "ingrowis",
+        "GapAccess": "Batchdep",
+        "Lulalend": "lulalend",
+        "Fundrr": "Fundrr",
+        "Bridgement": "Rebridgem",
+        "Cash/Capital Connect": "cconnect",
+        "Bizflex": "Bizflex",
+        "Ikhokha": "Ikhoka advance",
+        "Yoco": "Yoco Advance",
+        "Vodalend": "INLLVODACO",
+        "Merchant Capital": "Merch Cap MCA",
+        "SWYPE": "SWYPE FS",
+        "The Capital Partners": "THECP",
+        "Tymebank": "Tymebank",
+        "Genfin": "Genfin",
+        "Flow48": "Elend 48",
+    }
+
+    if not df.empty:
+        facility_matches = []
+        for facility_name, keyword in facility_keywords.items():
+            keyword_lower = keyword.lower()
+            matched = df[
+                df["Description"].astype(str).str.lower().str.contains(keyword_lower, na=False)
+            ]
+            for _, row in matched.iterrows():
+                description = str(row["Description"])
+                amount = row.get("Credit", 0) or 0
+                debit = row.get("Debit", 0) or 0
+                if debit > 0:
+                    amount_str = f"-R{debit:,.2f}"
+                elif amount > 0:
+                    amount_str = f"R{amount:,.2f}"
+                else:
+                    amount_str = "R0.00"
+                facility_matches.append([
+                    facility_name,
+                    row["Date"],
+                    description[:45] + "..." if len(description) > 45 else description,
+                    amount_str,
+                ])
+
+        if facility_matches:
+            facility_data = [["Facility", "Date", "Description", "Amount"]]
+            facility_data.extend(facility_matches)
+
+            facility_table = Table(
+                facility_data,
+                colWidths=[1.2 * inch, 0.8 * inch, 2.8 * inch, 1.2 * inch],
+            )
+            facility_table.setStyle(
+                TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#8e44ad")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("ALIGN", (2, 1), (2, -1), "LEFT"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+                    ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
+                    ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                    ("FONTSIZE", (0, 1), (-1, -1), 7),
+                    ("TOPPADDING", (0, 1), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+                    (
+                        "ROWBACKGROUNDS",
+                        (0, 1),
+                        (-1, -1),
+                        [colors.white, colors.HexColor("#f5eef8")],
+                    ),
+                ])
+            )
+            elements.append(facility_table)
+        else:
+            elements.append(
+                Paragraph("No existing facilities detected.", styles["Normal"])
+            )
+
+    # Service Penalties Section
+    elements.append(Spacer(1, 30))
+    elements.append(Paragraph("Service Penalties", styles["Heading2"]))
+    elements.append(Spacer(1, 10))
+
+    penalty_keywords = ["Unpaid", "Excess item fees", "Honouring Fee"]
+
+    if not df.empty:
+        penalty_matches = []
         for _, row in df.iterrows():
             description = str(row["Description"])
-            if len(description) > 30:
-                description = description[:30] + "..."
+            desc_lower = description.lower()
+            matched_keyword = None
+            for kw in penalty_keywords:
+                if kw.lower() in desc_lower:
+                    matched_keyword = kw
+                    break
+            if matched_keyword:
+                amount = row.get("Credit", 0) or 0
+                debit = row.get("Debit", 0) or 0
+                if debit > 0:
+                    amount_str = f"-R{debit:,.2f}"
+                elif amount > 0:
+                    amount_str = f"R{amount:,.2f}"
+                else:
+                    amount_str = "R0.00"
+                penalty_matches.append([
+                    row["Date"],
+                    description[:50] + "..." if len(description) > 50 else description,
+                    matched_keyword,
+                    amount_str,
+                ])
 
-            txn_data.append([
-                row["Date"],
-                description,
-                f"R{row['Debit']:,.2f}" if row["Debit"] > 0 else "-",
-                f"R{row['Credit']:,.2f}" if row["Credit"] > 0 else "-",
-                f"R{row['Balance']:,.2f}",
-            ])
+        if penalty_matches:
+            penalty_data = [["Date", "Description", "Type", "Amount"]]
+            penalty_data.extend(penalty_matches)
 
-        txn_table = Table(
-            txn_data,
-            colWidths=[0.8 * inch, 2.2 * inch, 1 * inch, 1 * inch, 1 * inch],
-        )
-        txn_table.setStyle(
-            TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("ALIGN", (1, 1), (1, -1), "LEFT"),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 9),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
-                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 1), (-1, -1), 8),
-                ("TOPPADDING", (0, 1), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
-                (
-                    "ROWBACKGROUNDS",
-                    (0, 1),
-                    (-1, -1),
-                    [colors.white, colors.HexColor("#f8f9fa")],
-                ),
-            ])
-        )
-        elements.append(txn_table)
+            penalty_table = Table(
+                penalty_data,
+                colWidths=[0.8 * inch, 2.8 * inch, 1.2 * inch, 1.2 * inch],
+            )
+            penalty_table.setStyle(
+                TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e74c3c")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("ALIGN", (1, 1), (1, -1), "LEFT"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+                    ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
+                    ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                    ("FONTSIZE", (0, 1), (-1, -1), 7),
+                    ("TOPPADDING", (0, 1), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+                    (
+                        "ROWBACKGROUNDS",
+                        (0, 1),
+                        (-1, -1),
+                        [colors.white, colors.HexColor("#fdedec")],
+                    ),
+                ])
+            )
+            elements.append(penalty_table)
+        else:
+            elements.append(
+                Paragraph("No service penalties detected.", styles["Normal"])
+            )
 
     doc.build(elements)
     buffer.seek(0)
