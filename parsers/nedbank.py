@@ -13,7 +13,7 @@ class NedbankParser(BaseBankParser):
 
     BANK_NAME = "Nedbank"
     BANK_ID = "nedbank"
-    DETECTION_KEYWORDS = ["nedbank"]
+    DETECTION_KEYWORDS = ["nedbank", "statement enquiry"]
 
     # Date patterns
     DATE_PATTERN = re.compile(r"(\d{2}/\d{2}/\d{4})")
@@ -142,8 +142,8 @@ class NedbankParser(BaseBankParser):
                 date_str = None
                 rest_start = 0
 
-                # Format with transaction number prefix: "000821 30/08/2025"
-                txn_date_match = re.search(r"^\d{6}\s+(\d{2}/\d{2}/\d{4})", line)
+                # Format with transaction/page number prefix: "162 01/11/2025" or "000821 30/08/2025"
+                txn_date_match = re.search(r"^\d{3,6}\s+(\d{2}/\d{2}/\d{4})", line)
                 if txn_date_match:
                     date_str = txn_date_match.group(1)
                     rest_start = txn_date_match.end()
@@ -222,8 +222,34 @@ class NedbankParser(BaseBankParser):
                             debit = abs(diff)
                         else:
                             credit = diff
+                elif format_type == "enquiry":
+                    # Statement Enquiry format: single signed amount + balance
+                    # e.g. "-400,000.00 1,945,663.81" (debit) or "500,000.00 2,131,611.92" (credit)
+                    if len(cleaned_amounts) == 2:
+                        amt_val = cleaned_amounts[0]
+                        if is_negative[0]:
+                            debit = amt_val
+                        else:
+                            credit = amt_val
+                    elif len(cleaned_amounts) == 1:
+                        # Only balance (e.g. BROUGHT FORWARD already handled above)
+                        if rows:
+                            prev_balance = rows[-1]["Balance"]
+                            diff = balance - prev_balance
+                            if diff < 0:
+                                debit = abs(diff)
+                            else:
+                                credit = diff
+                    elif len(cleaned_amounts) == 3:
+                        # Possible extra amount in description text (e.g. "VAT 28/10-25/11 = R16.97")
+                        # Last is balance, second-to-last is the transaction amount
+                        amt_val = cleaned_amounts[-2]
+                        if is_negative[-2]:
+                            debit = amt_val
+                        else:
+                            credit = amt_val
                 else:
-                    # Standard and Enquiry formats: Debits, Credits, Balance
+                    # Standard format: Debits, Credits, Balance
                     if len(cleaned_amounts) == 3:
                         debit = cleaned_amounts[-3]
                         credit = cleaned_amounts[-2]
