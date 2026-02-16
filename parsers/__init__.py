@@ -50,6 +50,11 @@ SUPPORTED_BANKS: list[str] = [parser.BANK_NAME for parser in PARSER_REGISTRY]
 def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
     """Detect which bank the statement is from.
 
+    Uses a scoring system based on keyword frequency rather than first-match.
+    A bank's own statement will mention its name many times (headers, footers,
+    branding), while a transaction referencing another bank will only mention
+    it once or twice. The parser with the highest score wins.
+
     Args:
         pdf_file: PDF file buffer
 
@@ -63,10 +68,18 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
         if pdf.pages:
             first_page_text = pdf.pages[0].extract_text() or ""
 
+            best_parser = None
+            best_score = 0
+
             for parser_class in PARSER_REGISTRY:
-                if parser_class.can_parse(first_page_text):
-                    pdf_file.seek(0)
-                    return parser_class.BANK_ID
+                score = parser_class.detection_score(first_page_text)
+                if score > best_score:
+                    best_score = score
+                    best_parser = parser_class
+
+            if best_parser is not None:
+                pdf_file.seek(0)
+                return best_parser.BANK_ID
 
     pdf_file.seek(0)
     return None

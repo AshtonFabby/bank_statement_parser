@@ -18,8 +18,9 @@ class NedbankParser(BaseBankParser):
     # Date patterns
     DATE_PATTERN = re.compile(r"(\d{2}/\d{2}/\d{4})")
     DATE_PATTERN_YMD = re.compile(r"^(\d{2})/(\d{2})/(\d{4})")  # Start of line
-    # Amount pattern - handles comma and space separators
-    AMOUNT_PATTERN = re.compile(r"-?[\d\s,]+\.\d{2}")
+    # Amount pattern - handles comma separators and optional thousands space separator
+    # Negative lookbehind for digits prevents matching partial phone numbers
+    AMOUNT_PATTERN = re.compile(r"(?<!\d)-?\d{1,3}(?:[,\s]\d{3})*\.\d{2}(?!\d)")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Nedbank statement."""

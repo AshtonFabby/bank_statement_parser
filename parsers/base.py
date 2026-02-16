@@ -76,6 +76,23 @@ class BaseBankParser(ABC):
         text_lower = text.lower()
         return any(keyword in text_lower for keyword in cls.DETECTION_KEYWORDS)
 
+    @classmethod
+    def detection_score(cls, text: str) -> int:
+        """Score how confident we are this parser matches the given text.
+
+        Uses keyword frequency to distinguish between a bank's own statement
+        (where its name appears many times in headers, footers, branding) vs
+        a mere transaction reference to another bank.
+
+        Returns:
+            Integer score (0 = no match, higher = more confident)
+        """
+        text_lower = text.lower()
+        score = 0
+        for keyword in cls.DETECTION_KEYWORDS:
+            score += text_lower.count(keyword)
+        return score
+
     @abstractmethod
     def extract_account_info(self) -> AccountInfo:
         """Extract account information from the statement.
