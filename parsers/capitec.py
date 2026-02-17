@@ -443,8 +443,10 @@ class CapitecParser(BaseBankParser):
 
                 if first_amt < 0:
                     debit = abs(first_amt)
-                    if second_amt > 0 and second_amt < abs(first_amt):
-                        debit += second_amt  # Fees
+                    if second_amt < 0:
+                        debit += abs(second_amt)  # Fees (negative format)
+                    elif second_amt > 0 and second_amt < abs(first_amt):
+                        debit += second_amt  # Fees (positive format)
                 elif first_amt > 0:
                     credit = first_amt
                     if second_amt < 0:
@@ -472,6 +474,11 @@ class CapitecParser(BaseBankParser):
         first_page = self._extract_first_page_text()
         first_page_lower = first_page.lower()
 
+        # Check for standard format indicators first - "Money in"/"Money out"
+        # columns indicate standard format even on business accounts
+        if "money in" in first_page_lower and "money out" in first_page_lower:
+            return "standard"
+
         # Business format indicators
         if "business account" in first_page_lower:
             return "business"
@@ -491,6 +498,9 @@ class CapitecParser(BaseBankParser):
                             for row in table:
                                 if row:
                                     combined = " ".join(c for c in row if c).lower()
+                                    if "money in" in combined and "money out" in combined:
+                                        self._reset_file()
+                                        return "standard"
                                     if "post" in combined and "date" in combined:
                                         self._reset_file()
                                         return "business"
