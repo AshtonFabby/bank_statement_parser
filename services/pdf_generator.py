@@ -201,6 +201,54 @@ def generate_summary_pdf(
         elements.append(revenue_table)
         elements.append(Spacer(1, 30))
 
+    # Monthly Turnover Section
+    elements.append(Paragraph("Monthly Turnover", styles["Heading2"]))
+    elements.append(Spacer(1, 10))
+
+    if not df.empty:
+        dates = pd.to_datetime(df["Date"], dayfirst=True)
+        df_monthly = df.copy()
+        df_monthly["Month"] = dates.dt.to_period("M")
+        monthly_group = df_monthly.groupby("Month").agg(
+            Total_Credits=("Credit", "sum"),
+            Credit_Count=("Credit", lambda x: (x > 0).sum()),
+        ).reset_index()
+        monthly_group = monthly_group.sort_values("Month")
+
+        monthly_data = [["Month", "Total Turnover (Credits)", "Number of Credits"]]
+        for _, row in monthly_group.iterrows():
+            monthly_data.append([
+                str(row["Month"]),
+                f"R{row['Total_Credits']:,.2f}",
+                str(int(row["Credit_Count"])),
+            ])
+
+        monthly_table = Table(monthly_data, colWidths=[1.5 * inch, 2 * inch, 2 * inch])
+        monthly_table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a6e8e")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 10),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 10),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#ecf0f1")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 1), (-1, -1), 9),
+                ("TOPPADDING", (0, 1), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
+                (
+                    "ROWBACKGROUNDS",
+                    (0, 1),
+                    (-1, -1),
+                    [colors.white, colors.HexColor("#d6eaf8")],
+                ),
+            ])
+        )
+        elements.append(monthly_table)
+    elements.append(Spacer(1, 30))
+
     # Top 15 Credits Section
     elements.append(Paragraph("Top 15 Credits", styles["Heading2"]))
     elements.append(Spacer(1, 10))
@@ -334,52 +382,39 @@ def generate_summary_pdf(
     }
 
     if not df.empty:
-        facility_matches = []
+        facility_summary = []
         for facility_name, keyword in facility_keywords.items():
             keyword_lower = keyword.lower()
             matched = df[
                 df["Description"].astype(str).str.lower().str.contains(keyword_lower, na=False)
             ]
-            for _, row in matched.iterrows():
-                description = str(row["Description"])
-                amount = row.get("Credit", 0) or 0
-                debit = row.get("Debit", 0) or 0
-                if debit > 0:
-                    amount_str = f"-R{debit:,.2f}"
-                elif amount > 0:
-                    amount_str = f"R{amount:,.2f}"
-                else:
-                    amount_str = "R0.00"
-                facility_matches.append([
-                    facility_name,
-                    row["Date"],
-                    description[:45] + "..." if len(description) > 45 else description,
-                    amount_str,
-                ])
+            count = len(matched)
+            if count > 0:
+                facility_summary.append([facility_name, str(count)])
 
-        if facility_matches:
-            facility_data = [["Facility", "Date", "Description", "Amount"]]
-            facility_data.extend(facility_matches)
+        if facility_summary:
+            facility_data = [["Facility", "Total Detections"]]
+            facility_data.extend(facility_summary)
 
             facility_table = Table(
                 facility_data,
-                colWidths=[1.2 * inch, 0.8 * inch, 2.8 * inch, 1.2 * inch],
+                colWidths=[3 * inch, 2 * inch],
             )
             facility_table.setStyle(
                 TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#8e44ad")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
                     ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("ALIGN", (2, 1), (2, -1), "LEFT"),
+                    ("ALIGN", (0, 1), (0, -1), "LEFT"),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("FONTSIZE", (0, 0), (-1, 0), 10),
                     ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
                     ("BACKGROUND", (0, 1), (-1, -1), colors.white),
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
                     ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                    ("FONTSIZE", (0, 1), (-1, -1), 7),
-                    ("TOPPADDING", (0, 1), (-1, -1), 4),
-                    ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+                    ("FONTSIZE", (0, 1), (-1, -1), 9),
+                    ("TOPPADDING", (0, 1), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
                     (
                         "ROWBACKGROUNDS",
                         (0, 1),
@@ -402,54 +437,38 @@ def generate_summary_pdf(
     penalty_keywords = ["Unpaid", "Excess item fees", "Honouring Fee"]
 
     if not df.empty:
-        penalty_matches = []
+        penalty_counts: dict[str, int] = {}
         for _, row in df.iterrows():
-            description = str(row["Description"])
-            desc_lower = description.lower()
-            matched_keyword = None
+            desc_lower = str(row["Description"]).lower()
             for kw in penalty_keywords:
                 if kw.lower() in desc_lower:
-                    matched_keyword = kw
+                    penalty_counts[kw] = penalty_counts.get(kw, 0) + 1
                     break
-            if matched_keyword:
-                amount = row.get("Credit", 0) or 0
-                debit = row.get("Debit", 0) or 0
-                if debit > 0:
-                    amount_str = f"-R{debit:,.2f}"
-                elif amount > 0:
-                    amount_str = f"R{amount:,.2f}"
-                else:
-                    amount_str = "R0.00"
-                penalty_matches.append([
-                    row["Date"],
-                    description[:50] + "..." if len(description) > 50 else description,
-                    matched_keyword,
-                    amount_str,
-                ])
 
-        if penalty_matches:
-            penalty_data = [["Date", "Description", "Type", "Amount"]]
-            penalty_data.extend(penalty_matches)
+        if penalty_counts:
+            penalty_data = [["Penalty Type", "Total Detections"]]
+            for kw, count in penalty_counts.items():
+                penalty_data.append([kw, str(count)])
 
             penalty_table = Table(
                 penalty_data,
-                colWidths=[0.8 * inch, 2.8 * inch, 1.2 * inch, 1.2 * inch],
+                colWidths=[3 * inch, 2 * inch],
             )
             penalty_table.setStyle(
                 TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e74c3c")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
                     ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("ALIGN", (1, 1), (1, -1), "LEFT"),
+                    ("ALIGN", (0, 1), (0, -1), "LEFT"),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("FONTSIZE", (0, 0), (-1, 0), 10),
                     ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
                     ("BACKGROUND", (0, 1), (-1, -1), colors.white),
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
                     ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                    ("FONTSIZE", (0, 1), (-1, -1), 7),
-                    ("TOPPADDING", (0, 1), (-1, -1), 4),
-                    ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+                    ("FONTSIZE", (0, 1), (-1, -1), 9),
+                    ("TOPPADDING", (0, 1), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
                     (
                         "ROWBACKGROUNDS",
                         (0, 1),
