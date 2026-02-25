@@ -4,13 +4,17 @@ A FastAPI application for parsing South African bank statements.
 Supports multiple banks with auto-detection.
 """
 
+import asyncio
 import io
+import json
 import zipfile
 from datetime import datetime
-from typing import List
+from typing import List, Optional
+from urllib.parse import unquote
 
+import httpx
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -25,8 +29,8 @@ from services import (
 
 app = FastAPI(
     title="Bank Statement Parser API",
-    description="Parse bank statements from major South African banks. Supports single or multiple file uploads.",
-    version="2.1.0",
+    description="Parse bank statements from major South African banks. Supports single or multiple file uploads or URLs.",
+    version="2.2.0",
 )
 
 app.add_middleware(
@@ -46,11 +50,11 @@ def read_root():
     """Get API information and supported banks."""
     return {
         "message": "Bank Statement Parser API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "supported_banks": SUPPORTED_BANKS,
         "endpoints": {
-            "/parse": "POST - Upload one or more PDFs to parse (returns ZIP with combined Excel + PDF)",
-            "/parse/json": "POST - Upload one or more PDFs to parse (returns JSON with combined results)",
+            "/parse": "POST - Upload one or more PDFs or provide links (returns ZIP with combined Excel + PDF)",
+            "/parse/json": "POST - Upload one or more PDFs or provide links (returns JSON with combined results)",
         },
     }
 
@@ -61,57 +65,33 @@ def list_banks():
     return {"supported_banks": SUPPORTED_BANKS}
 
 
-async def process_single_file(file: UploadFile, raise_on_error: bool = True) -> dict:
-    """Process a single PDF file and return parsed data.
-
-    Args:
-        file: PDF file upload
-        raise_on_error: If True, raise exceptions. If False, return error info.
-
-    Returns:
-        Dict with bank_name, summary, df, filename, and optional error
-
-    Raises:
-        HTTPException: If file is invalid or parsing fails (when raise_on_error=True)
-    """
+async def _parse_pdf_bytes(contents: bytes, filename: str, raise_on_error: bool = True) -> dict:
+    """Parse raw PDF bytes and return structured result."""
     result = {
-        "filename": file.filename,
+        "filename": filename,
         "bank_name": None,
         "summary": None,
         "df": None,
         "error": None,
     }
 
-    if not file.filename.lower().endswith(".pdf"):
-        error_msg = f"Only PDF files are accepted. '{file.filename}' is not a PDF."
-        if raise_on_error:
-            raise HTTPException(status_code=400, detail=error_msg)
-        result["error"] = error_msg
-        return result
-
-    contents = await file.read()
-
-    # Detect bank type using a temporary buffer
     detection_buffer = io.BytesIO(contents)
     parser = get_parser(detection_buffer)
     if not parser:
-        error_msg = f"Could not detect bank type for '{file.filename}'. Supported banks: {', '.join(SUPPORTED_BANKS)}"
+        error_msg = f"Could not detect bank type for '{filename}'. Supported banks: {', '.join(SUPPORTED_BANKS)}"
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
         result["error"] = error_msg
         return result
 
-    # Create a fresh buffer for parsing to avoid issues with file position
     parsing_buffer = io.BytesIO(contents)
-
-    # Re-initialize parser with fresh buffer
     bank_id = parser.BANK_ID
     parser = get_parser_by_id(bank_id, parsing_buffer)
 
     try:
         account_info, df = parser.parse()
     except Exception as e:
-        error_msg = f"Failed to parse '{file.filename}': {str(e)}"
+        error_msg = f"Failed to parse '{filename}': {str(e)}"
         if raise_on_error:
             raise HTTPException(status_code=500, detail=error_msg)
         result["error"] = error_msg
@@ -119,7 +99,7 @@ async def process_single_file(file: UploadFile, raise_on_error: bool = True) -> 
         return result
 
     if df.empty:
-        error_msg = f"No transactions detected in '{file.filename}'"
+        error_msg = f"No transactions detected in '{filename}'"
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
         result["error"] = error_msg
@@ -132,37 +112,80 @@ async def process_single_file(file: UploadFile, raise_on_error: bool = True) -> 
         "bank_name": account_info.bank,
         "summary": summary,
         "df": df,
-        "filename": file.filename,
+        "filename": filename,
         "error": None,
     }
 
 
+async def process_single_file(file: UploadFile, raise_on_error: bool = True) -> dict:
+    """Process a single PDF upload and return parsed data."""
+    if not file.filename.lower().endswith(".pdf"):
+        error_msg = f"Only PDF files are accepted. '{file.filename}' is not a PDF."
+        if raise_on_error:
+            raise HTTPException(status_code=400, detail=error_msg)
+        return {"filename": file.filename, "bank_name": None, "summary": None, "df": None, "error": error_msg}
+
+    contents = await file.read()
+    return await _parse_pdf_bytes(contents, file.filename, raise_on_error)
+
+
+async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
+    """Download a PDF from a URL and return parsed data."""
+    filename = unquote(url.split("/")[-1].split("?")[0])
+    if not filename.lower().endswith(".pdf"):
+        filename = filename + ".pdf"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url)
+    except httpx.RequestError as e:
+        error_msg = f"Failed to download '{url}': {str(e)}"
+        if raise_on_error:
+            raise HTTPException(status_code=400, detail=error_msg)
+        return {"filename": filename, "bank_name": None, "summary": None, "df": None, "error": error_msg}
+
+    if response.status_code != 200:
+        error_msg = f"Failed to download '{url}': HTTP {response.status_code}"
+        if raise_on_error:
+            raise HTTPException(status_code=400, detail=error_msg)
+        return {"filename": filename, "bank_name": None, "summary": None, "df": None, "error": error_msg}
+
+    return await _parse_pdf_bytes(response.content, filename, raise_on_error)
+
+
 @app.post("/parse")
-async def parse_statement(files: List[UploadFile] = File(...)):
+async def parse_statement(
+    files: Optional[List[UploadFile]] = File(None),
+    links: Optional[str] = Form(None),
+):
     """Parse one or more bank statement PDFs and return combined Excel + summary PDF in a ZIP file.
 
-    Args:
-        files: One or more PDF file uploads
-
-    Returns:
-        ZIP file containing combined Excel and summary PDF from all uploaded documents
+    Accepts either:
+    - `files`: one or more PDF file uploads (multipart form)
+    - `links`: JSON array of PDF URLs (form field), e.g. `["https://...","https://..."]`
     """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_buffer = io.BytesIO()
+    if not files and not links:
+        raise HTTPException(status_code=400, detail="Provide either 'files' or 'links'.")
 
-    # Process all files - don't raise on individual file errors when processing multiple
-    results = []
-    errors = []
-    raise_on_error = len(files) == 1  # Only raise if single file
+    url_list: List[str] = []
+    if links:
+        try:
+            url_list = json.loads(links)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="'links' must be a valid JSON array of URLs.")
 
-    for file in files:
-        result = await process_single_file(file, raise_on_error=raise_on_error)
-        if result["error"]:
-            errors.append(result)
-        else:
-            results.append(result)
+    total_count = len(files or []) + len(url_list)
+    raise_on_error = total_count == 1
 
-    # If all files failed, raise error
+    tasks = [
+        *[process_single_file(f, raise_on_error=raise_on_error) for f in (files or [])],
+        *[process_single_url(u, raise_on_error=raise_on_error) for u in url_list],
+    ]
+    all_results = await asyncio.gather(*tasks)
+
+    results = [r for r in all_results if not r["error"]]
+    errors = [r for r in all_results if r["error"]]
+
     if not results:
         error_details = "; ".join([f"{e['filename']}: {e['error']}" for e in errors])
         raise HTTPException(
@@ -170,24 +193,22 @@ async def parse_statement(files: List[UploadFile] = File(...)):
             detail=f"No transactions could be extracted from any file. Errors: {error_details}",
         )
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_buffer = io.BytesIO()
+
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         all_dfs = []
-
-        # Collect all dataframes with source information
         for result in results:
             df_with_source = result["df"].copy()
             df_with_source["Source"] = result["bank_name"]
             all_dfs.append(df_with_source)
 
-        # Combine all dataframes
         combined_df = pd.concat(all_dfs, ignore_index=True)
 
-        # Generate combined Excel
         combined_excel_buffer = io.BytesIO()
         combined_df.to_excel(combined_excel_buffer, index=False, engine="openpyxl")
         zip_file.writestr(f"combined_parsed_{timestamp}.xlsx", combined_excel_buffer.getvalue())
 
-        # Generate combined summary PDF
         combined_summary = calculate_summary(combined_df)
         combined_coverage = calculate_coverage(combined_df)
         combined_activity = calculate_activity_volume(combined_df)
@@ -197,7 +218,6 @@ async def parse_statement(files: List[UploadFile] = File(...)):
         )
         zip_file.writestr(f"combined_summary_{timestamp}.pdf", combined_pdf_buffer.getvalue())
 
-        # If there were partial failures, include an error report
         if errors:
             error_report = "Files that could not be parsed:\n\n"
             for e in errors:
@@ -216,22 +236,38 @@ async def parse_statement(files: List[UploadFile] = File(...)):
 
 
 @app.post("/parse/json")
-async def parse_statement_json(files: List[UploadFile] = File(...)):
+async def parse_statement_json(
+    files: Optional[List[UploadFile]] = File(None),
+    links: Optional[str] = Form(None),
+):
     """Parse one or more bank statement PDFs and return JSON response.
 
-    Args:
-        files: One or more PDF file uploads
-
-    Returns:
-        JSON with combined summary and transactions from all files.
+    Accepts either:
+    - `files`: one or more PDF file uploads (multipart form)
+    - `links`: JSON array of PDF URLs (form field), e.g. `["https://...","https://..."]`
     """
-    # Process all files - don't raise on individual file errors when processing multiple
+    if not files and not links:
+        raise HTTPException(status_code=400, detail="Provide either 'files' or 'links'.")
+
+    url_list: List[str] = []
+    if links:
+        try:
+            url_list = json.loads(links)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="'links' must be a valid JSON array of URLs.")
+
+    total_count = len(files or []) + len(url_list)
+    raise_on_error = total_count == 1
+
+    tasks = [
+        *[process_single_file(f, raise_on_error=raise_on_error) for f in (files or [])],
+        *[process_single_url(u, raise_on_error=raise_on_error) for u in url_list],
+    ]
+    all_results = await asyncio.gather(*tasks)
+
     all_dfs = []
     errors = []
-    raise_on_error = len(files) == 1  # Only raise if single file
-
-    for file in files:
-        result = await process_single_file(file, raise_on_error=raise_on_error)
+    for result in all_results:
         if result["error"]:
             errors.append({"filename": result["filename"], "error": result["error"]})
         else:
@@ -239,7 +275,6 @@ async def parse_statement_json(files: List[UploadFile] = File(...)):
             df_with_source["Source"] = result["bank_name"]
             all_dfs.append(df_with_source)
 
-    # If all files failed, raise error
     if not all_dfs:
         error_details = "; ".join([f"{e['filename']}: {e['error']}" for e in errors])
         raise HTTPException(
@@ -247,7 +282,6 @@ async def parse_statement_json(files: List[UploadFile] = File(...)):
             detail=f"No transactions could be extracted from any file. Errors: {error_details}",
         )
 
-    # Combine all dataframes
     combined_df = pd.concat(all_dfs, ignore_index=True)
     combined_summary = calculate_summary(combined_df)
     coverage = calculate_coverage(combined_df)
@@ -260,11 +294,10 @@ async def parse_statement_json(files: List[UploadFile] = File(...)):
         "activity_volume": activity.to_dict(),
         "revenue": revenue.to_dict(),
         "transactions": combined_df.to_dict(orient="records"),
-        "document_count": len(files),
+        "document_count": total_count,
         "successful_files": len(all_dfs),
     }
 
-    # Include errors if any files failed
     if errors:
         response["parsing_errors"] = errors
 
