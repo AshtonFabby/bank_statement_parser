@@ -20,10 +20,10 @@ from fastapi.responses import StreamingResponse
 
 from parsers import SUPPORTED_BANKS, get_parser, get_parser_by_id
 from services import (
-    calculate_summary,
-    calculate_coverage,
     calculate_activity_volume,
+    calculate_coverage,
     calculate_revenue,
+    calculate_summary,
     generate_summary_pdf,
 )
 
@@ -38,6 +38,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://bank-statement-parser-frontend.vercel.app",
+        "https://superadmin.todayscapital.co.za/",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -65,7 +66,9 @@ def list_banks():
     return {"supported_banks": SUPPORTED_BANKS}
 
 
-async def _parse_pdf_bytes(contents: bytes, filename: str, raise_on_error: bool = True) -> dict:
+async def _parse_pdf_bytes(
+    contents: bytes, filename: str, raise_on_error: bool = True
+) -> dict:
     """Parse raw PDF bytes and return structured result."""
     result = {
         "filename": filename,
@@ -123,7 +126,13 @@ async def process_single_file(file: UploadFile, raise_on_error: bool = True) -> 
         error_msg = f"Only PDF files are accepted. '{file.filename}' is not a PDF."
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
-        return {"filename": file.filename, "bank_name": None, "summary": None, "df": None, "error": error_msg}
+        return {
+            "filename": file.filename,
+            "bank_name": None,
+            "summary": None,
+            "df": None,
+            "error": error_msg,
+        }
 
     contents = await file.read()
     return await _parse_pdf_bytes(contents, file.filename, raise_on_error)
@@ -142,13 +151,25 @@ async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
         error_msg = f"Failed to download '{url}': {str(e)}"
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
-        return {"filename": filename, "bank_name": None, "summary": None, "df": None, "error": error_msg}
+        return {
+            "filename": filename,
+            "bank_name": None,
+            "summary": None,
+            "df": None,
+            "error": error_msg,
+        }
 
     if response.status_code != 200:
         error_msg = f"Failed to download '{url}': HTTP {response.status_code}"
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
-        return {"filename": filename, "bank_name": None, "summary": None, "df": None, "error": error_msg}
+        return {
+            "filename": filename,
+            "bank_name": None,
+            "summary": None,
+            "df": None,
+            "error": error_msg,
+        }
 
     return await _parse_pdf_bytes(response.content, filename, raise_on_error)
 
@@ -165,14 +186,18 @@ async def parse_statement(
     - `links`: JSON array of PDF URLs (form field), e.g. `["https://...","https://..."]`
     """
     if not files and not links:
-        raise HTTPException(status_code=400, detail="Provide either 'files' or 'links'.")
+        raise HTTPException(
+            status_code=400, detail="Provide either 'files' or 'links'."
+        )
 
     url_list: List[str] = []
     if links:
         try:
             url_list = json.loads(links)
         except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="'links' must be a valid JSON array of URLs.")
+            raise HTTPException(
+                status_code=400, detail="'links' must be a valid JSON array of URLs."
+            )
 
     total_count = len(files or []) + len(url_list)
     raise_on_error = total_count == 1
@@ -207,16 +232,24 @@ async def parse_statement(
 
         combined_excel_buffer = io.BytesIO()
         combined_df.to_excel(combined_excel_buffer, index=False, engine="openpyxl")
-        zip_file.writestr(f"combined_parsed_{timestamp}.xlsx", combined_excel_buffer.getvalue())
+        zip_file.writestr(
+            f"combined_parsed_{timestamp}.xlsx", combined_excel_buffer.getvalue()
+        )
 
         combined_summary = calculate_summary(combined_df)
         combined_coverage = calculate_coverage(combined_df)
         combined_activity = calculate_activity_volume(combined_df)
         combined_revenue = calculate_revenue(combined_df)
         combined_pdf_buffer = generate_summary_pdf(
-            combined_df, combined_summary, combined_coverage, combined_activity, combined_revenue
+            combined_df,
+            combined_summary,
+            combined_coverage,
+            combined_activity,
+            combined_revenue,
         )
-        zip_file.writestr(f"combined_summary_{timestamp}.pdf", combined_pdf_buffer.getvalue())
+        zip_file.writestr(
+            f"combined_summary_{timestamp}.pdf", combined_pdf_buffer.getvalue()
+        )
 
         if errors:
             error_report = "Files that could not be parsed:\n\n"
@@ -247,14 +280,18 @@ async def parse_statement_json(
     - `links`: JSON array of PDF URLs (form field), e.g. `["https://...","https://..."]`
     """
     if not files and not links:
-        raise HTTPException(status_code=400, detail="Provide either 'files' or 'links'.")
+        raise HTTPException(
+            status_code=400, detail="Provide either 'files' or 'links'."
+        )
 
     url_list: List[str] = []
     if links:
         try:
             url_list = json.loads(links)
         except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="'links' must be a valid JSON array of URLs.")
+            raise HTTPException(
+                status_code=400, detail="'links' must be a valid JSON array of URLs."
+            )
 
     total_count = len(files or []) + len(url_list)
     raise_on_error = total_count == 1
