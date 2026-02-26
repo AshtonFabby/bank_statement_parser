@@ -25,6 +25,8 @@ class StandardBankParser(BaseBankParser):
         r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\b",
         re.IGNORECASE,
     )
+    # Date format for current account statements: YYYYMMDD (e.g. 20250804)
+    DATE_PATTERN_8D = re.compile(r"\b(20\d{2})(\d{2})(\d{2})\b")
     # Amount pattern - handles comma-separated amounts and negative values
     AMOUNT_PATTERN = re.compile(r"-?[\d,]+\.\d{2}")
     # SA format amounts: comma decimal, space thousands (e.g. -432 785,10 or +41 635,00)
@@ -77,6 +79,16 @@ class StandardBankParser(BaseBankParser):
                 account_type = acc_match.group(1).strip()
                 account_number = acc_match.group(2).strip().replace(" ", "")
 
+        # Current account statement format: "Account 0000220835705 NAME"
+        if not account_number:
+            acc_match = re.search(
+                r"^Account\s+(\d{10,})\s+",
+                first_page,
+                re.IGNORECASE | re.MULTILINE,
+            )
+            if acc_match:
+                account_number = acc_match.group(1)
+
         # Look for "Product name: BUS CURRENT" or "CURRENT ACC" pattern
         if not account_type:
             product_match = re.search(
@@ -86,6 +98,16 @@ class StandardBankParser(BaseBankParser):
             )
             if product_match:
                 account_type = product_match.group(1).strip()
+
+        # Current account statement: "CURRENT ACCOUNT - STATEMENT DETAILS"
+        if not account_type:
+            type_match = re.search(
+                r"(CURRENT ACCOUNT|SAVINGS ACCOUNT|CHEQUE ACCOUNT)",
+                first_page,
+                re.IGNORECASE,
+            )
+            if type_match:
+                account_type = type_match.group(1).title()
 
         return AccountInfo(
             bank=self.BANK_NAME,
@@ -115,7 +137,13 @@ class StandardBankParser(BaseBankParser):
                 and self.SA_AMOUNT_PATTERN.search(first_page)):
             return "transactional_history"
 
-        # Check for business statement format (period-thousands, comma-decimal)
+        # Current account statement format: columns are Page/Details/Service Fee/Debit/Credit/Date/Balance
+        # with YYYYMMDD dates and comma-thousands amounts
+        if re.search(r"Details.*Service.*Fee.*Debit.*Credit.*Date.*Balance", first_page,
+                      re.DOTALL | re.IGNORECASE):
+            return "current_account"
+
+        # Check for older business statement format (period-thousands, comma-decimal)
         if re.search(r"Details.*Service.*Credits.*Date.*Balance", first_page,
                       re.DOTALL | re.IGNORECASE):
             return "business_statement"
@@ -311,19 +339,123 @@ class StandardBankParser(BaseBankParser):
 
         return pd.DataFrame(rows)
 
+    def _extract_transactions_current_account(self) -> pd.DataFrame:
+        """Extract transactions from Standard Bank current account statement.
+
+        Format: Page# | Description | Service Fee | Debit | Credit | Date(YYYYMMDD) | Balance
+        - Transaction lines start with a page number digit
+        - Reference/narration lines follow without a page number prefix
+        - Amounts use comma-thousands, period-decimal (e.g. -480,569.42)
+        - Dates are 8-digit YYYYMMDD
+        """
+        rows = []
+
+        for page_text in self._iterate_pages():
+            lines = page_text.split("\n")
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Skip page headers/footers
+                if re.match(r"^Standard Bank", line, re.IGNORECASE):
+                    continue
+                if re.search(r"The Standard Bank of South Africa", line, re.IGNORECASE):
+                    continue
+                if re.search(r"Computer Generated Copy", line, re.IGNORECASE):
+                    continue
+                if re.search(r"CURRENT ACCOUNT - STATEMENT DETAILS", line, re.IGNORECASE):
+                    continue
+                if "Page" in line and "Details" in line and "Balance" in line:
+                    continue
+
+                # Transaction lines start with a page number (digit(s) then space)
+                page_num_match = re.match(r"^(\d+)\s+", line)
+                if not page_num_match:
+                    # Reference/narration line - append to last transaction description
+                    if rows and line:
+                        rows[-1]["Description"] = (rows[-1]["Description"] + " " + line).strip()
+                    continue
+
+                # Strip leading page number
+                body = line[page_num_match.end():]
+
+                # Find date (YYYYMMDD)
+                date_match = self.DATE_PATTERN_8D.search(body)
+                if not date_match:
+                    continue
+
+                year = date_match.group(1)
+                month = date_match.group(2)
+                day = date_match.group(3)
+                date_str = f"{day}/{month}/{year}"
+
+                # Find all amounts
+                amounts_raw = self.AMOUNT_PATTERN.findall(body)
+                if len(amounts_raw) < 2:
+                    continue
+
+                cleaned = [self._clean_amount(a) for a in amounts_raw]
+                balance = cleaned[-1]
+
+                # Description is text before the first amount
+                first_amt_match = self.AMOUNT_PATTERN.search(body)
+                description = body[:first_amt_match.start()].strip()
+
+                # Handle BALANCE BROUGHT FORWARD
+                if "BALANCE BROUGHT FORWARD" in description.upper():
+                    rows.append(create_transaction_row(
+                        date_str, "Balance Brought Forward", 0.0, 0.0, balance
+                    ))
+                    continue
+
+                # Column layout: Service Fee | Debit | Credit | (date) | Balance
+                # With 4 amounts: [service_fee, debit, credit, balance]
+                debit = 0.0
+                credit = 0.0
+                if len(cleaned) >= 4:
+                    debit_val = cleaned[-3]
+                    credit_val = cleaned[-2]
+                    if debit_val < 0:
+                        debit = abs(debit_val)
+                    if credit_val > 0:
+                        credit = credit_val
+                elif len(cleaned) == 3:
+                    # Missing one column — use sign to determine debit vs credit
+                    txn_val = cleaned[-2]
+                    if txn_val < 0:
+                        debit = abs(txn_val)
+                    else:
+                        credit = txn_val
+                elif len(cleaned) == 2 and rows:
+                    # Only balance present; derive from change
+                    diff = balance - rows[-1]["Balance"]
+                    if diff < 0:
+                        debit = abs(diff)
+                    else:
+                        credit = diff
+
+                rows.append(create_transaction_row(date_str, description, debit, credit, balance))
+
+        return pd.DataFrame(rows)
+
     def extract_transactions(self) -> pd.DataFrame:
         """Extract transactions from Standard Bank statement.
 
-        Supports three formats:
+        Supports four formats:
         1. Regular statement: Payments | Deposits | Balance (period decimal)
         2. Transactional history: In (R) | Out (R) | Bank fees (R) | Balance (R) (comma decimal, space thousands)
         3. Business statement: Details | Service Fee | Credits/Debits | Date | Balance (period thousands, comma decimal)
+        4. Current account statement: Page | Details | Service Fee | Debit | Credit | Date(YYYYMMDD) | Balance
         """
         fmt = self._detect_format()
         if fmt == "transactional_history":
             return self._extract_transactions_history()
         elif fmt == "business_statement":
             return self._extract_transactions_business()
+        elif fmt == "current_account":
+            return self._extract_transactions_current_account()
         return self._extract_transactions_regular()
 
     def _extract_transactions_regular(self) -> pd.DataFrame:
