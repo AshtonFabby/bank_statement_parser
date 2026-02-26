@@ -38,7 +38,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://bank-statement-parser-frontend.vercel.app",
-        "https://superadmin.todayscapital.co.za/",
+        "https://superadmin.todayscapital.co.za",
+        "todayscapital.co.za",
+        "https://vercel.com/ashtonfabbys-projects/todays-capital-super-admin",
     ],
     allow_credentials=True,
     allow_methods=["*"],
