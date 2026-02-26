@@ -17,6 +17,7 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pypdf import PdfReader, PdfWriter
 
 from parsers import SUPPORTED_BANKS, get_parser, get_parser_by_id
 from services import (
@@ -24,6 +25,7 @@ from services import (
     calculate_coverage,
     calculate_revenue,
     calculate_summary,
+    generate_prevet_pdf,
     generate_summary_pdf,
 )
 
@@ -341,3 +343,85 @@ async def parse_statement_json(
         response["parsing_errors"] = errors
 
     return response
+
+
+@app.post("/generate-full-prevet")
+async def generate_full_prevet(
+    links: Optional[str] = Form(None),
+    prevet_data: str = Form(...),
+):
+    """Generate a combined PDF with the PreVet form on top and bank analysis below.
+
+    Accepts:
+    - `prevet_data`: JSON string of prevet form fields
+    - `links`: JSON array of bank statement PDF URLs (optional)
+    """
+    try:
+        form_data = json.loads(prevet_data)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="'prevet_data' must be valid JSON.")
+
+    # ── 1. Generate PreVet PDF locally ────────────────────────────────────
+    prevet_buffer = generate_prevet_pdf(form_data)
+    prevet_pdf_bytes = prevet_buffer.getvalue()
+
+    # ── 2. Generate Bank Analysis PDF (if links provided) ─────────────────
+    bank_analysis_pdf_bytes: Optional[bytes] = None
+
+    if links:
+        try:
+            url_list = json.loads(links)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400, detail="'links' must be a valid JSON array of URLs."
+            )
+
+        if url_list:
+            tasks = [process_single_url(u, raise_on_error=False) for u in url_list]
+            all_results = await asyncio.gather(*tasks)
+            results = [r for r in all_results if not r["error"]]
+
+            if results:
+                all_dfs = []
+                for result in results:
+                    df_with_source = result["df"].copy()
+                    df_with_source["Source"] = result["bank_name"]
+                    all_dfs.append(df_with_source)
+
+                combined_df = pd.concat(all_dfs, ignore_index=True)
+                combined_summary = calculate_summary(combined_df)
+                combined_coverage = calculate_coverage(combined_df)
+                combined_activity = calculate_activity_volume(combined_df)
+                combined_revenue = calculate_revenue(combined_df)
+                bank_pdf_buffer = generate_summary_pdf(
+                    combined_df,
+                    combined_summary,
+                    combined_coverage,
+                    combined_activity,
+                    combined_revenue,
+                )
+                bank_analysis_pdf_bytes = bank_pdf_buffer.getvalue()
+
+    # ── 3. Merge PDFs ─────────────────────────────────────────────────────
+    writer = PdfWriter()
+
+    prevet_reader = PdfReader(io.BytesIO(prevet_pdf_bytes))
+    for page in prevet_reader.pages:
+        writer.add_page(page)
+
+    if bank_analysis_pdf_bytes:
+        bank_reader = PdfReader(io.BytesIO(bank_analysis_pdf_bytes))
+        for page in bank_reader.pages:
+            writer.add_page(page)
+
+    output_buffer = io.BytesIO()
+    writer.write(output_buffer)
+    output_buffer.seek(0)
+
+    return StreamingResponse(
+        output_buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": 'attachment; filename="full-prevet.pdf"'
+        },
+    )

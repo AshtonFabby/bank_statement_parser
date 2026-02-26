@@ -11,6 +11,7 @@ from .summary import (
     RevenueMetrics,
 )
 from .pdf_generator import generate_summary_pdf
+from .prevet_pdf_generator import generate_prevet_pdf
 
 __all__ = [
     "calculate_summary",
@@ -22,4 +23,5 @@ __all__ = [
     "calculate_revenue",
     "RevenueMetrics",
     "generate_summary_pdf",
+    "generate_prevet_pdf",
 ]
