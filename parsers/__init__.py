@@ -67,10 +67,11 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
     with pdfplumber.open(pdf_file) as pdf:
         if pdf.pages:
             first_page_text = pdf.pages[0].extract_text() or ""
-            # Limit to first 6 lines so transaction references to other banks
+            # Limit to first 20 lines so transaction references to other banks
             # don't inflate scores above the actual issuing bank's branding.
-            # Standard Bank current account format starts transactions on line 7.
-            header_text = "\n".join(first_page_text.split("\n")[:6])
+            # Nedbank statements have branding on line 13 (nedbank.co.za) and
+            # ABSA Transaction History has "ABSA" on line 6.
+            header_text = "\n".join(first_page_text.split("\n")[:20])
 
             best_parser = None
             best_score = 0
