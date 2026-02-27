@@ -130,11 +130,18 @@ class StandardBankParser(BaseBankParser):
         """Detect which Standard Bank statement format this is."""
         first_page = self._extract_first_page_text()
 
+        # Regular statement has "Payments" and "Deposits" column headers
+        if re.search(r"Payments.*Deposits.*Balance", first_page, re.DOTALL | re.IGNORECASE):
+            return "regular"
+
         # Check for transactional history format (In/Out columns, space-thousands)
         if re.search(r"In \(R\)|Out \(R\)|Bank fees \(R\)", first_page):
             return "transactional_history"
+        # Transactional history uses space-thousands SA amounts (e.g. "+41 635,00")
+        # Require at least one space-thousands group to avoid matching regular comma-thousands
+        SA_SPACE_THOUSANDS = re.compile(r"[+-]?\d{1,3}(?: \d{3})+,\d{2}")
         if (re.search(r"standardbank\.co\.za", first_page, re.IGNORECASE)
-                and self.SA_AMOUNT_PATTERN.search(first_page)):
+                and SA_SPACE_THOUSANDS.search(first_page)):
             return "transactional_history"
 
         # Current account statement format: columns are Page/Details/Service Fee/Debit/Credit/Date/Balance
