@@ -10,10 +10,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
-from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    Image,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 from reportlab.platypus.flowables import Flowable
 
-from .summary import Summary, CoverageMetrics, ActivityVolume, RevenueMetrics
+from .summary import ActivityVolume, CoverageMetrics, RevenueMetrics, Summary
 
 # ── Design tokens (matching prevet style) ──────────────────────────────────
 GREEN_PRIMARY = colors.HexColor("#00ce4c")
@@ -28,7 +35,9 @@ RED_HEADER_TEXT = colors.HexColor("#c0392b")
 RED_BORDER = colors.HexColor("#fad5d0")
 RED_ROW_ALT = colors.HexColor("#fff8f8")
 
-LOGO_URL = "https://res.cloudinary.com/dbmvi2vd7/image/upload/v1738309402/getfunds-logo.png"
+LOGO_URL = (
+    "https://res.cloudinary.com/dbmvi2vd7/image/upload/v1738309402/getfunds-logo.png"
+)
 CORNER_RADIUS = 6
 
 # Module-level logo cache (raw bytes)
@@ -38,7 +47,9 @@ _logo_bytes: bytes | None = None
 class RoundedTable(Flowable):
     """Wraps a ReportLab Table and clips it to a rounded rectangle."""
 
-    def __init__(self, table: Table, radius: int = CORNER_RADIUS, border_color=BORDER_COLOR):
+    def __init__(
+        self, table: Table, radius: int = CORNER_RADIUS, border_color=BORDER_COLOR
+    ):
         Flowable.__init__(self)
         self.table = table
         self.radius = radius
@@ -125,22 +136,24 @@ def _green_table_style(align_col_0_bold: bool = False) -> TableStyle:
 
 def _red_table_style() -> TableStyle:
     """Clean red-accented table for debits/penalties. Border/rounding handled by RoundedTable."""
-    return TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), RED_HEADER_BG),
-        ("TEXTCOLOR", (0, 0), (-1, 0), RED_HEADER_TEXT),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 9),
-        ("TOPPADDING", (0, 0), (-1, 0), 9),
-        ("BOTTOMPADDING", (0, 0), (-1, 0), 9),
-        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-        ("INNERGRID", (0, 0), (-1, -1), 0.5, RED_BORDER),
-        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 1), (-1, -1), 9),
-        ("TEXTCOLOR", (0, 1), (-1, -1), TEXT_DARK),
-        ("TOPPADDING", (0, 1), (-1, -1), 7),
-        ("BOTTOMPADDING", (0, 1), (-1, -1), 7),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, RED_ROW_ALT]),
-    ])
+    return TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), RED_HEADER_BG),
+            ("TEXTCOLOR", (0, 0), (-1, 0), RED_HEADER_TEXT),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("TOPPADDING", (0, 0), (-1, 0), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 9),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, RED_BORDER),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("TEXTCOLOR", (0, 1), (-1, -1), TEXT_DARK),
+            ("TOPPADDING", (0, 1), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 7),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, RED_ROW_ALT]),
+        ]
+    )
 
 
 def generate_summary_pdf(
@@ -233,7 +246,9 @@ def generate_summary_pdf(
 
     # ── Coverage ──────────────────────────────────────────────────────────
     if coverage:
-        elements.append(Paragraph("COVERAGE, DATA INTEGRITY & STRUCTURE", section_style))
+        elements.append(
+            Paragraph("COVERAGE, DATA INTEGRITY & STRUCTURE", section_style)
+        )
 
         coverage_data = [
             ["Metric", "Value"],
@@ -312,17 +327,155 @@ def generate_summary_pdf(
             .sort_values("Month")
         )
 
-        monthly_data = [["Month", "Total Turnover (Credits)", "Number of Credits"]]
-        for _, row in monthly_group.iterrows():
-            monthly_data.append([
-                str(row["Month"]),
-                f"R {row['Total_Credits']:,.2f}",
-                str(int(row["Credit_Count"])),
-            ])
+        RISK_COLORS = {
+            "LOW": colors.HexColor("#22c55e"),
+            "MODERATE": colors.HexColor("#f59e0b"),
+            "HIGH": colors.HexColor("#f97316"),
+            "SEVERE": colors.HexColor("#ef4444"),
+        }
 
-        monthly_table = Table(monthly_data, colWidths=[2 * inch, 2.5 * inch, 1.5 * inch])
-        monthly_table.setStyle(_green_table_style(align_col_0_bold=True))
+        def _conc_risk(largest_pct: float, top3_pct: float):
+            if largest_pct > 50:
+                level = "SEVERE"
+            elif largest_pct > 30:
+                level = "HIGH"
+            elif largest_pct > 15:
+                level = "MODERATE"
+            else:
+                level = "LOW"
+            flag = "*" if top3_pct > 60 else ""
+            return level, f"{level}{flag} ({largest_pct:.0f}%)"
+
+        monthly_data = [
+            ["Month", "Total Turnover (Credits)", "Credits", "Concentration Risk"]
+        ]
+        risk_levels_for_rows = []
+        top5_detail_rows = []  # flat rows for the compressed detail table
+
+        for _, row in monthly_group.iterrows():
+            month = row["Month"]
+            total = float(row["Total_Credits"])
+
+            month_credits_df = df_monthly[
+                (df_monthly["Month"] == month) & (df_monthly["Credit"] > 0)
+            ].nlargest(5, "Credit")
+
+            largest = (
+                float(month_credits_df["Credit"].iloc[0])
+                if len(month_credits_df) > 0
+                else 0.0
+            )
+            top3_sum = float(month_credits_df["Credit"].iloc[:3].sum())
+
+            largest_pct = (largest / total * 100) if total > 0 else 0.0
+            top3_pct = (top3_sum / total * 100) if total > 0 else 0.0
+
+            level, label = _conc_risk(largest_pct, top3_pct)
+
+            monthly_data.append(
+                [
+                    str(month),
+                    f"R {total:,.2f}",
+                    str(int(row["Credit_Count"])),
+                    label,
+                ]
+            )
+            risk_levels_for_rows.append(level)
+
+            # Collect top 5 for detail table (month label only on first row)
+            first = True
+            for _, txn in month_credits_df.iterrows():
+                desc = str(txn["Description"])
+                if len(desc) > 33:
+                    desc = desc[:33] + "..."
+                pct = (float(txn["Credit"]) / total * 100) if total > 0 else 0.0
+                top5_detail_rows.append(
+                    [
+                        str(month) if first else "",
+                        desc,
+                        f"R {txn['Credit']:,.2f}",
+                        f"{pct:.1f}%",
+                    ]
+                )
+                first = False
+
+        # Monthly table style with per-row risk colouring
+        monthly_commands = [
+            ("BACKGROUND", (0, 0), (-1, 0), HEADER_BG),
+            ("TEXTCOLOR", (0, 0), (-1, 0), GREEN_SECONDARY),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("TOPPADDING", (0, 0), (-1, 0), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 9),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_COLOR),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("TEXTCOLOR", (0, 1), (-1, -1), TEXT_DARK),
+            ("TOPPADDING", (0, 1), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 7),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, ROW_ALT]),
+            ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+            ("TEXTCOLOR", (0, 1), (0, -1), colors.HexColor("#4a5568")),
+        ]
+        for i, level in enumerate(risk_levels_for_rows, start=1):
+            c = RISK_COLORS.get(level, TEXT_DARK)
+            monthly_commands.append(("TEXTCOLOR", (3, i), (3, i), c))
+            monthly_commands.append(("FONTNAME", (3, i), (3, i), "Helvetica-Bold"))
+
+        monthly_table = Table(
+            monthly_data,
+            colWidths=[1.4 * inch, 2.1 * inch, 0.7 * inch, 1.8 * inch],
+        )
+        monthly_table.setStyle(TableStyle(monthly_commands))
         elements.append(RoundedTable(monthly_table))
+
+        # ── Top 5 credits per month (concentration risk detail) ───────────
+        if top5_detail_rows:
+            elements.append(Spacer(1, 4))
+            small_label_style = ParagraphStyle(
+                "SmallLabel",
+                parent=styles["Normal"],
+                fontSize=7.5,
+                fontName="Helvetica-Bold",
+                textColor=colors.HexColor("#718096"),
+                spaceBefore=0,
+                spaceAfter=3,
+            )
+            elements.append(
+                Paragraph(
+                    "Top 5 credits per month — used for concentration risk calculation ",
+                    small_label_style,
+                )
+            )
+
+            detail_data = [["Month", "Description", "Amount", "% Rev"]]
+            detail_data.extend(top5_detail_rows)
+
+            detail_table = Table(
+                detail_data,
+                colWidths=[0.85 * inch, 3.0 * inch, 1.1 * inch, 0.75 * inch],
+            )
+            detail_commands = [
+                ("BACKGROUND", (0, 0), (-1, 0), HEADER_BG),
+                ("TEXTCOLOR", (0, 0), (-1, 0), GREEN_SECONDARY),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 7.5),
+                ("TOPPADDING", (0, 0), (-1, 0), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_COLOR),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 1), (-1, -1), 7.5),
+                ("TEXTCOLOR", (0, 1), (-1, -1), TEXT_DARK),
+                ("TOPPADDING", (0, 1), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 3),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, ROW_ALT]),
+                ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+                ("TEXTCOLOR", (0, 1), (0, -1), colors.HexColor("#4a5568")),
+            ]
+            detail_table.setStyle(TableStyle(detail_commands))
+            elements.append(RoundedTable(detail_table))
 
     # ── Top 15 Credits ────────────────────────────────────────────────────
     elements.append(Paragraph("TOP 15 CREDITS", section_style))
@@ -336,11 +489,13 @@ def generate_summary_pdf(
                 description = str(row["Description"])
                 if len(description) > 45:
                     description = description[:45] + "..."
-                credit_data.append([
-                    row["Date"],
-                    description,
-                    f"R {row['Credit']:,.2f}",
-                ])
+                credit_data.append(
+                    [
+                        row["Date"],
+                        description,
+                        f"R {row['Credit']:,.2f}",
+                    ]
+                )
 
             credit_table = Table(
                 credit_data,
@@ -349,7 +504,9 @@ def generate_summary_pdf(
             credit_table.setStyle(_green_table_style())
             elements.append(RoundedTable(credit_table))
         else:
-            elements.append(Paragraph("No credit transactions found.", styles["Normal"]))
+            elements.append(
+                Paragraph("No credit transactions found.", styles["Normal"])
+            )
 
     # ── Top 15 Debits ─────────────────────────────────────────────────────
     elements.append(Paragraph("TOP 15 DEBITS", section_style))
@@ -363,11 +520,13 @@ def generate_summary_pdf(
                 description = str(row["Description"])
                 if len(description) > 45:
                     description = description[:45] + "..."
-                debit_data.append([
-                    row["Date"],
-                    description,
-                    f"R {row['Debit']:,.2f}",
-                ])
+                debit_data.append(
+                    [
+                        row["Date"],
+                        description,
+                        f"R {row['Debit']:,.2f}",
+                    ]
+                )
 
             debit_table = Table(
                 debit_data,
@@ -409,7 +568,10 @@ def generate_summary_pdf(
         for facility_name, keyword in facility_keywords.items():
             keyword_lower = keyword.lower()
             matched = df[
-                df["Description"].astype(str).str.lower().str.contains(keyword_lower, na=False)
+                df["Description"]
+                .astype(str)
+                .str.lower()
+                .str.contains(keyword_lower, na=False)
             ]
             if len(matched) > 0:
                 facility_summary.append([facility_name, str(len(matched))])
@@ -422,7 +584,9 @@ def generate_summary_pdf(
             facility_table.setStyle(_green_table_style())
             elements.append(RoundedTable(facility_table))
         else:
-            elements.append(Paragraph("No existing facilities detected.", styles["Normal"]))
+            elements.append(
+                Paragraph("No existing facilities detected.", styles["Normal"])
+            )
 
     # ── Service Penalties ─────────────────────────────────────────────────
     elements.append(Paragraph("SERVICE PENALTIES", section_style))
@@ -447,7 +611,9 @@ def generate_summary_pdf(
             penalty_table.setStyle(_red_table_style())
             elements.append(RoundedTable(penalty_table, border_color=RED_BORDER))
         else:
-            elements.append(Paragraph("No service penalties detected.", styles["Normal"]))
+            elements.append(
+                Paragraph("No service penalties detected.", styles["Normal"])
+            )
 
     doc.build(elements)
     buffer.seek(0)
