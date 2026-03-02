@@ -13,13 +13,13 @@ class ABSAParser(BaseBankParser):
 
     BANK_NAME = "ABSA"
     BANK_ID = "absa"
-    DETECTION_KEYWORDS = ["absa"]
+    DETECTION_KEYWORDS = ["absa", "cheque account statement"]
 
     # Date patterns - ABSA uses multiple formats
     DATE_PATTERN_DMY = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4})")  # DD/MM/YYYY or D/M/YYYY
     DATE_PATTERN_YMD = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")  # YYYY-MM-DD (Transaction History)
-    # Amount pattern - handles space as thousands separator
-    AMOUNT_PATTERN = re.compile(r"-?[\d\s,]+\.\d{2}")
+    # Amount pattern - handles space as thousands separator and trailing minus (e.g. "11 236.59-")
+    AMOUNT_PATTERN = re.compile(r"-?[\d\s,]+\.\d{2}-?")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from ABSA statement."""
@@ -143,7 +143,7 @@ class ABSAParser(BaseBankParser):
                 for amt in amounts:
                     val = self._clean_amount(amt)
                     cleaned_amounts.append(abs(val))
-                    is_negative.append(val < 0 or amt.strip().startswith("-"))
+                    is_negative.append(val < 0 or amt.strip().startswith("-") or amt.strip().endswith("-"))
 
                 # Extract description (text before first amount)
                 first_amount_match = self.AMOUNT_PATTERN.search(rest_of_line)

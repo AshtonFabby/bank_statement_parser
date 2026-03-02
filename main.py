@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pypdf import PdfReader, PdfWriter
 
-from parsers import SUPPORTED_BANKS, get_parser, get_parser_by_id
+from parsers import SUPPORTED_BANKS, detect_bank, get_parser, get_parser_by_id
 from services import (
     calculate_activity_volume,
     calculate_coverage,
@@ -83,9 +83,16 @@ async def _parse_pdf_bytes(
     }
 
     detection_buffer = io.BytesIO(contents)
+    bank_id = detect_bank(detection_buffer)
+    if bank_id == "INVALID_PDF":
+        error_msg = "Could not be opened. The file may be corrupted or is not a valid PDF."
+        if raise_on_error:
+            raise HTTPException(status_code=400, detail=error_msg)
+        result["error"] = error_msg
+        return result
     parser = get_parser(detection_buffer)
     if not parser:
-        error_msg = f"Could not detect bank type for '{filename}'. Supported banks: {', '.join(SUPPORTED_BANKS)}"
+        error_msg = "Bank not recognised."
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
         result["error"] = error_msg
@@ -98,7 +105,7 @@ async def _parse_pdf_bytes(
     try:
         account_info, df = parser.parse()
     except Exception as e:
-        error_msg = f"Failed to parse '{filename}': {str(e)}"
+        error_msg = f"Failed to parse statement: {str(e)}"
         if raise_on_error:
             raise HTTPException(status_code=500, detail=error_msg)
         result["error"] = error_msg
@@ -106,7 +113,7 @@ async def _parse_pdf_bytes(
         return result
 
     if df.empty:
-        error_msg = f"No transactions detected in '{filename}'"
+        error_msg = "No transactions detected."
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
         result["error"] = error_msg
@@ -127,7 +134,7 @@ async def _parse_pdf_bytes(
 async def process_single_file(file: UploadFile, raise_on_error: bool = True) -> dict:
     """Process a single PDF upload and return parsed data."""
     if not file.filename.lower().endswith(".pdf"):
-        error_msg = f"Only PDF files are accepted. '{file.filename}' is not a PDF."
+        error_msg = "Only PDF files are accepted."
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
         return {
@@ -152,7 +159,7 @@ async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url)
     except httpx.RequestError as e:
-        error_msg = f"Failed to download '{url}': {str(e)}"
+        error_msg = f"Failed to download file: {str(e)}"
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
         return {
@@ -164,7 +171,7 @@ async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
         }
 
     if response.status_code != 200:
-        error_msg = f"Failed to download '{url}': HTTP {response.status_code}"
+        error_msg = f"Failed to download file: HTTP {response.status_code}"
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
         return {

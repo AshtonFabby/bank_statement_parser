@@ -62,9 +62,14 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
         Bank ID string or None if not detected
     """
     import pdfplumber
+    from pdfplumber.utils.exceptions import PdfminerException
 
     pdf_file.seek(0)
-    with pdfplumber.open(pdf_file) as pdf:
+    try:
+        pdf_context = pdfplumber.open(pdf_file)
+    except PdfminerException:
+        return "INVALID_PDF"
+    with pdf_context as pdf:
         if pdf.pages:
             first_page_text = pdf.pages[0].extract_text() or ""
             # Limit to first 20 lines so transaction references to other banks
