@@ -574,13 +574,15 @@ def generate_summary_pdf(
                 .str.contains(keyword_lower, na=False)
             ]
             if len(matched) > 0:
-                facility_summary.append([facility_name, str(len(matched))])
+                last_date = pd.to_datetime(matched["Date"], dayfirst=True).max()
+                last_date_str = last_date.strftime("%Y-%m-%d") if pd.notna(last_date) else "N/A"
+                facility_summary.append([facility_name, str(len(matched)), last_date_str])
 
         if facility_summary:
-            facility_data = [["Facility", "Total Detections"]]
+            facility_data = [["Facility", "Total Detections", "Last Payment Date"]]
             facility_data.extend(facility_summary)
 
-            facility_table = Table(facility_data, colWidths=[4 * inch, 2 * inch])
+            facility_table = Table(facility_data, colWidths=[3.5 * inch, 1.5 * inch, 1.5 * inch])
             facility_table.setStyle(_green_table_style())
             elements.append(RoundedTable(facility_table))
         else:
