@@ -76,7 +76,10 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
             # don't inflate scores above the actual issuing bank's branding.
             # Nedbank statements have branding on line 13 (nedbank.co.za) and
             # ABSA Transaction History has "ABSA" on line 6.
-            header_text = "\n".join(first_page_text.split("\n")[:20])
+            # Also include the last 5 lines (footer) because some FNB formats
+            # only carry branding in the page footer.
+            _lines = first_page_text.split("\n")
+            header_text = "\n".join(_lines[:20] + _lines[-5:])
 
             best_parser = None
             best_score = 0

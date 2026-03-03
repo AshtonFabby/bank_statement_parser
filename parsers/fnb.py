@@ -255,6 +255,9 @@ class FNBParser(BaseBankParser):
         first_amount_match = self.AMOUNT_PATTERN_CR_DR.search(rest_of_line)
         if first_amount_match:
             description = rest_of_line[:first_amount_match.start()].strip()
+            # Strip trailing service fee decimal (e.g. "0.00" or "4.62") and
+            # any sign character that precedes the transaction amount column.
+            description = re.sub(r'\s+\d[\d,]*\.\d+\s*[-+]?\s*$', '', description).strip()
         else:
             return None
 
