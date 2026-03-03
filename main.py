@@ -156,7 +156,7 @@ async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
         filename = filename + ".pdf"
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.get(url)
     except httpx.RequestError as e:
         error_msg = f"Failed to download file: {str(e)}"

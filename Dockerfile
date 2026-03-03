@@ -15,4 +15,11 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["gunicorn", "main:app", \
+    "--worker-class", "uvicorn.workers.UvicornWorker", \
+    "--workers", "2", \
+    "--timeout", "300", \
+    "--graceful-timeout", "30", \
+    "--bind", "0.0.0.0:8000", \
+    "--limit-request-line", "0", \
+    "--limit-request-field_size", "0"]
