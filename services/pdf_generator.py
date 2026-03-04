@@ -22,6 +22,19 @@ from reportlab.platypus.flowables import Flowable
 
 from .summary import ActivityVolume, CoverageMetrics, RevenueMetrics, Summary
 
+
+def _format_date(val) -> str:
+    """Format a date value for display in the PDF.
+
+    Handles datetime objects, Timestamp, NaT, and string dates.
+    Returns dd/mm/yyyy format or empty string for missing dates.
+    """
+    if pd.isna(val):
+        return ""
+    if isinstance(val, (pd.Timestamp, datetime)):
+        return val.strftime("%d/%m/%Y")
+    return str(val)
+
 # ── Design tokens (matching prevet style) ──────────────────────────────────
 GREEN_PRIMARY = colors.HexColor("#00ce4c")
 GREEN_SECONDARY = colors.HexColor("#00a83d")
@@ -491,7 +504,7 @@ def generate_summary_pdf(
                     description = description[:45] + "..."
                 credit_data.append(
                     [
-                        row["Date"],
+                        _format_date(row["Date"]),
                         description,
                         f"R {row['Credit']:,.2f}",
                     ]
@@ -522,7 +535,7 @@ def generate_summary_pdf(
                     description = description[:45] + "..."
                 debit_data.append(
                     [
-                        row["Date"],
+                        _format_date(row["Date"]),
                         description,
                         f"R {row['Debit']:,.2f}",
                     ]

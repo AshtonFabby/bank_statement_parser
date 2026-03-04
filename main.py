@@ -380,7 +380,9 @@ def _build_report_from_transactions(transactions: list) -> tuple:
         if col in combined_df.columns:
             combined_df[col] = pd.to_numeric(combined_df[col], errors="coerce")
     if "Date" in combined_df.columns:
-        combined_df["Date"] = pd.to_datetime(combined_df["Date"], errors="coerce")
+        combined_df["Date"] = pd.to_datetime(
+            combined_df["Date"], dayfirst=True, errors="coerce"
+        )
     combined_df = _deduplicate_transactions(combined_df)
     summary = calculate_summary(combined_df)
     coverage = calculate_coverage(combined_df)
