@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import List, Optional
 from urllib.parse import unquote
 
+import certifi
 import httpx
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -37,14 +38,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://bank-statement-parser-frontend.vercel.app",
-        "https://superadmin.todayscapital.co.za",
-        "todayscapital.co.za",
-        "https://vercel.com/ashtonfabbys-projects/todays-capital-super-admin",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -169,7 +164,7 @@ async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
         filename = filename + ".pdf"
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=120.0, verify=certifi.where()) as client:
             response = await client.get(url)
     except httpx.RequestError as e:
         error_msg = f"Failed to download file: {str(e)}"
@@ -365,16 +360,83 @@ async def parse_statement_json(
     return response
 
 
+def _build_report_from_transactions(transactions: list) -> tuple:
+    """Build combined DataFrame and analysis from pre-parsed transaction records."""
+    combined_df = pd.DataFrame(transactions)
+    # Ensure numeric columns
+    for col in ("Debit", "Credit", "Balance"):
+        if col in combined_df.columns:
+            combined_df[col] = pd.to_numeric(combined_df[col], errors="coerce")
+    if "Date" in combined_df.columns:
+        combined_df["Date"] = pd.to_datetime(combined_df["Date"], errors="coerce")
+    combined_df = _deduplicate_transactions(combined_df)
+    summary = calculate_summary(combined_df)
+    coverage = calculate_coverage(combined_df)
+    activity = calculate_activity_volume(combined_df)
+    revenue = calculate_revenue(combined_df)
+    return combined_df, summary, coverage, activity, revenue
+
+
+@app.post("/report")
+async def generate_report(
+    transactions: str = Form(...),
+):
+    """Generate ZIP (Excel + summary PDF) from pre-parsed transaction JSON.
+
+    Accepts:
+    - `transactions`: JSON array of transaction records (from /parse/json responses)
+    """
+    try:
+        records = json.loads(transactions)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400, detail="'transactions' must be a valid JSON array."
+        )
+
+    if not records:
+        raise HTTPException(status_code=400, detail="No transactions provided.")
+
+    combined_df, summary, coverage, activity, revenue = _build_report_from_transactions(
+        records
+    )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_buffer = io.BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        excel_buffer = io.BytesIO()
+        combined_df.to_excel(excel_buffer, index=False, engine="openpyxl")
+        zip_file.writestr(f"combined_parsed_{timestamp}.xlsx", excel_buffer.getvalue())
+
+        pdf_buffer = generate_summary_pdf(
+            combined_df, summary, coverage, activity, revenue
+        )
+        zip_file.writestr(f"combined_summary_{timestamp}.pdf", pdf_buffer.getvalue())
+
+    zip_buffer.seek(0)
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename=combined_statements_{timestamp}.zip"
+        },
+    )
+
+
 @app.post("/generate-full-prevet")
 async def generate_full_prevet(
-    links: Optional[str] = Form(None),
     prevet_data: str = Form(...),
+    links: Optional[str] = Form(None),
+    transactions: Optional[str] = Form(None),
 ):
     """Generate a combined PDF with the PreVet form on top and bank analysis below.
 
     Accepts:
     - `prevet_data`: JSON string of prevet form fields
-    - `links`: JSON array of bank statement PDF URLs (optional)
+    - `links`: JSON array of bank statement PDF URLs (optional, slow – downloads & parses)
+    - `transactions`: JSON array of pre-parsed transaction records (optional, fast)
+    If both `transactions` and `links` are provided, `transactions` takes precedence.
     """
     try:
         form_data = json.loads(prevet_data)
@@ -385,10 +447,28 @@ async def generate_full_prevet(
     prevet_buffer = generate_prevet_pdf(form_data)
     prevet_pdf_bytes = prevet_buffer.getvalue()
 
-    # ── 2. Generate Bank Analysis PDF (if links provided) ─────────────────
+    # ── 2. Generate Bank Analysis PDF ─────────────────────────────────────
     bank_analysis_pdf_bytes: Optional[bytes] = None
 
-    if links:
+    if transactions:
+        # Fast path: use pre-parsed transactions
+        try:
+            records = json.loads(transactions)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400, detail="'transactions' must be valid JSON."
+            )
+        if records:
+            combined_df, summary, coverage, activity, revenue = (
+                _build_report_from_transactions(records)
+            )
+            bank_pdf_buffer = generate_summary_pdf(
+                combined_df, summary, coverage, activity, revenue
+            )
+            bank_analysis_pdf_bytes = bank_pdf_buffer.getvalue()
+
+    elif links:
+        # Slow path: download & parse PDFs (kept for backwards compatibility)
         try:
             url_list = json.loads(links)
         except json.JSONDecodeError:
@@ -408,7 +488,9 @@ async def generate_full_prevet(
                     df_with_source["Source"] = result["bank_name"]
                     all_dfs.append(df_with_source)
 
-                combined_df = _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
+                combined_df = _deduplicate_transactions(
+                    pd.concat(all_dfs, ignore_index=True)
+                )
                 combined_summary = calculate_summary(combined_df)
                 combined_coverage = calculate_coverage(combined_df)
                 combined_activity = calculate_activity_volume(combined_df)
