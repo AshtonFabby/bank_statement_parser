@@ -149,6 +149,19 @@ async def process_single_file(file: UploadFile, raise_on_error: bool = True) -> 
     return await _parse_pdf_bytes(contents, file.filename, raise_on_error)
 
 
+def _deduplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove duplicate transactions that arise when a bank statement and transaction
+    history overlap in date range.  Two rows are considered duplicates when they share
+    the same Date, Description, Debit, and Credit values (Balance is intentionally
+    excluded because it can differ between document types for the same transaction).
+    The first occurrence is kept so bank-statement data takes precedence over
+    transaction-history data when files are ordered that way.
+    """
+    return df.drop_duplicates(
+        subset=["Date", "Description", "Debit", "Credit"], keep="first"
+    ).reset_index(drop=True)
+
+
 async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
     """Download a PDF from a URL and return parsed data."""
     filename = unquote(url.split("/")[-1].split("?")[0])
@@ -239,7 +252,7 @@ async def parse_statement(
             df_with_source["Source"] = result["bank_name"]
             all_dfs.append(df_with_source)
 
-        combined_df = pd.concat(all_dfs, ignore_index=True)
+        combined_df = _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
 
         combined_excel_buffer = io.BytesIO()
         combined_df.to_excel(combined_excel_buffer, index=False, engine="openpyxl")
@@ -330,7 +343,7 @@ async def parse_statement_json(
             detail=f"No transactions could be extracted from any file. Errors: {error_details}",
         )
 
-    combined_df = pd.concat(all_dfs, ignore_index=True)
+    combined_df = _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
     combined_summary = calculate_summary(combined_df)
     coverage = calculate_coverage(combined_df)
     activity = calculate_activity_volume(combined_df)
@@ -395,7 +408,7 @@ async def generate_full_prevet(
                     df_with_source["Source"] = result["bank_name"]
                     all_dfs.append(df_with_source)
 
-                combined_df = pd.concat(all_dfs, ignore_index=True)
+                combined_df = _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
                 combined_summary = calculate_summary(combined_df)
                 combined_coverage = calculate_coverage(combined_df)
                 combined_activity = calculate_activity_volume(combined_df)
