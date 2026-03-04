@@ -566,7 +566,7 @@ def generate_summary_pdf(
     if not df.empty:
         facility_summary = []
         for facility_name, keywords in facility_keywords.items():
-            desc_lower = df["Description"].astype(str).str.lower()
+            desc_lower = df["Description"].fillna("").astype(str).str.lower()
             matched = df[
                 desc_lower.apply(
                     lambda d: any(kw.lower() in d for kw in keywords)
