@@ -7,6 +7,7 @@ Supports multiple banks with auto-detection.
 import asyncio
 import io
 import json
+import math
 import zipfile
 from datetime import datetime
 from typing import List, Optional
@@ -17,7 +18,7 @@ import httpx
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pypdf import PdfReader, PdfWriter
 
 from parsers import SUPPORTED_BANKS, detect_bank, get_parser, get_parser_by_id
@@ -142,6 +143,17 @@ async def process_single_file(file: UploadFile, raise_on_error: bool = True) -> 
 
     contents = await file.read()
     return await _parse_pdf_bytes(contents, file.filename, raise_on_error)
+
+
+def _sanitize_for_json(obj):
+    """Recursively replace NaN/Infinity with None so the result is JSON-safe."""
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
 
 
 def _deduplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
@@ -357,7 +369,7 @@ async def parse_statement_json(
     if errors:
         response["parsing_errors"] = errors
 
-    return response
+    return JSONResponse(content=_sanitize_for_json(response))
 
 
 def _build_report_from_transactions(transactions: list) -> tuple:
