@@ -541,37 +541,36 @@ def generate_summary_pdf(
     elements.append(Paragraph("EXISTING FACILITIES DETECTED", section_style))
 
     facility_keywords = {
-        "Retail Capital": "Retail Capital",
-        "Pollen Finance": "pm8+PolFin",
-        "Cashflow Capital": "pm8@cfc",
-        "Business Fuel": "Bfuel",
-        "Growise": "ingrowis",
-        "GapAccess": "Batchdep",
-        "Lulalend": "lulalend",
-        "Fundrr": "Fundrr",
-        "Bridgement": "Rebridgem",
-        "Cash/Capital Connect": "cconnect",
-        "Bizflex": "Bizflex",
-        "Ikhokha": "Ikhoka advance",
-        "Yoco": "Yoco Advance",
-        "Vodalend": "INLLVODACO",
-        "Merchant Capital": "Merch Cap MCA",
-        "SWYPE": "SWYPE FS",
-        "The Capital Partners": "THECP",
-        "Tymebank": "Tymebank",
-        "Genfin": "Genfin",
-        "Flow48": "Elend 48",
+        "Retail Capital": ["Retail Capital"],
+        "Pollen Finance": ["Pollen Finance", "pm8+PolFin"],
+        "Cashflow Capital": ["pm8@cfc"],
+        "Business Fuel": ["Bfuel"],
+        "Growise": ["ingrowis"],
+        "GapAccess": ["Batchdep"],
+        "Lulalend": ["lulalend"],
+        "Fundrr": ["Fundrr"],
+        "Bridgement": ["Rebridgem"],
+        "Cash/Capital Connect": ["cconnect"],
+        "Bizflex": ["Bizflex"],
+        "Ikhokha": ["Ikhoka advance"],
+        "Yoco": ["Yoco Advance"],
+        "Vodalend": ["INLLVODACO"],
+        "Merchant Capital": ["Merch Cap MCA"],
+        "SWYPE": ["SWYPE FS"],
+        "The Capital Partners": ["THECP"],
+        "Tymebank": ["Tymebank"],
+        "Genfin": ["Genfin"],
+        "Flow48": ["Elend 48"],
     }
 
     if not df.empty:
         facility_summary = []
-        for facility_name, keyword in facility_keywords.items():
-            keyword_lower = keyword.lower()
+        for facility_name, keywords in facility_keywords.items():
+            desc_lower = df["Description"].astype(str).str.lower()
             matched = df[
-                df["Description"]
-                .astype(str)
-                .str.lower()
-                .str.contains(keyword_lower, na=False)
+                desc_lower.apply(
+                    lambda d: any(kw.lower() in d for kw in keywords)
+                )
             ]
             if len(matched) > 0:
                 last_date = pd.to_datetime(matched["Date"], dayfirst=True).max()
