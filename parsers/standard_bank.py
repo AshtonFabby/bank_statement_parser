@@ -125,6 +125,12 @@ class StandardBankParser(BaseBankParser):
     BIZ_END_PATTERN = re.compile(
         r"(\d{2})\s+(\d{2})\s+(\d{1,3}(?:\.\d{3})*,\d{2}-?)\s*$"
     )
+    # Business statement (international format): comma thousands, period decimal (e.g. 4,140.00-)
+    BIZ_INT_AMOUNT_PATTERN = re.compile(r"-?[\d,]+\.\d{2}-?")
+    # Business statement (international) line ending: MM DD Balance
+    BIZ_INT_END_PATTERN = re.compile(
+        r"(\d{2})\s+(\d{2})\s+(-?[\d,]+\.\d{2})\s*$"
+    )
 
     def _detect_format(self) -> str:
         """Detect which Standard Bank statement format this is."""
@@ -150,10 +156,14 @@ class StandardBankParser(BaseBankParser):
                       re.DOTALL | re.IGNORECASE):
             return "current_account"
 
-        # Check for older business statement format (period-thousands, comma-decimal)
+        # Check for business statement format (Details/Service/Credits/Date/Balance columns)
         if re.search(r"Details.*Service.*Credits.*Date.*Balance", first_page,
                       re.DOTALL | re.IGNORECASE):
-            return "business_statement"
+            # Distinguish number format: period-thousands/comma-decimal (e.g. 1.234,56)
+            # vs comma-thousands/period-decimal (e.g. 1,234.56)
+            if re.search(r"\d{1,3}(?:\.\d{3})+,\d{2}", first_page):
+                return "business_statement"
+            return "business_statement_int"
 
         return "regular"
 
@@ -346,6 +356,99 @@ class StandardBankParser(BaseBankParser):
 
         return pd.DataFrame(rows)
 
+    def _extract_transactions_business_int(self) -> pd.DataFrame:
+        """Extract transactions from Standard Bank business statement (international number format).
+
+        Same column layout as business_statement but uses comma-thousands, period-decimal
+        (e.g. 4,140.00-) instead of period-thousands, comma-decimal.
+        Columns: Details | Service Fee | Credits/Debits | Date (MM DD) | Balance
+        Trailing minus indicates debit amounts.
+        """
+        rows = []
+
+        # Extract year from statement period
+        first_page = self._extract_first_page_text()
+        year = "2025"
+        period_match = re.search(
+            r"Statement\s+from\s+.*?(\d{4})\s+to\s+.*?(\d{4})",
+            first_page, re.IGNORECASE,
+        )
+        if period_match:
+            year = period_match.group(2)
+
+        for page_text in self._iterate_pages():
+            lines = page_text.split("\n")
+            in_header = True
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Detect end of header block (column headers end with "Fee Debits")
+                if in_header:
+                    if "Fee" in line and ("Debits" in line or "Debit" in line):
+                        in_header = False
+                    continue
+
+                # Detect footer
+                if "These fees include VAT" in line or "fees include VAT" in line.lower():
+                    break
+
+                # Try to match transaction line (has MM DD Balance at end)
+                end_match = self.BIZ_INT_END_PATTERN.search(line)
+                if not end_match:
+                    # Handle BALANCE BROUGHT FORWARD without date (continuation pages)
+                    if "BALANCE BROUGHT FORWARD" in line.upper():
+                        continue
+
+                    # Continuation description line - append to last transaction
+                    if rows and line:
+                        rows[-1]["Description"] += " " + line
+                    continue
+
+                month = end_match.group(1)
+                day = end_match.group(2)
+                balance = self._clean_amount(end_match.group(3))
+                date_str = f"{day}/{month}/{year}"
+
+                # Get text before the date+balance
+                before_end = line[:end_match.start()].strip()
+
+                # Handle BALANCE BROUGHT FORWARD
+                if "BALANCE BROUGHT FORWARD" in before_end.upper():
+                    rows.append(create_transaction_row(
+                        date_str, "Balance Brought Forward", 0.0, 0.0, balance
+                    ))
+                    continue
+
+                # Find amounts in the text before date
+                amts = list(self.BIZ_INT_AMOUNT_PATTERN.finditer(before_end))
+
+                if not amts:
+                    continue
+
+                # Last amount before date is the transaction amount
+                amt_str = amts[-1].group()
+                is_debit = amt_str.endswith("-")
+                txn_amt = self._clean_amount(amt_str)
+
+                # Description is text before the first amount
+                description = before_end[:amts[0].start()].strip()
+
+                debit = 0.0
+                credit = 0.0
+                if is_debit or txn_amt < 0:
+                    debit = abs(txn_amt)
+                else:
+                    credit = txn_amt
+
+                rows.append(create_transaction_row(
+                    date_str, description, debit, credit, balance
+                ))
+
+        return pd.DataFrame(rows)
+
     def _extract_transactions_current_account(self) -> pd.DataFrame:
         """Extract transactions from Standard Bank current account statement.
 
@@ -461,6 +564,8 @@ class StandardBankParser(BaseBankParser):
             return self._extract_transactions_history()
         elif fmt == "business_statement":
             return self._extract_transactions_business()
+        elif fmt == "business_statement_int":
+            return self._extract_transactions_business_int()
         elif fmt == "current_account":
             return self._extract_transactions_current_account()
         return self._extract_transactions_regular()
