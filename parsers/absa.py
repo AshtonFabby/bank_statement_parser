@@ -206,6 +206,9 @@ class ABSAParser(BaseBankParser):
                 # Try DD/MM/YYYY format
                 date_match = self.DATE_PATTERN_DMY.match(line)
                 if not date_match:
+                    # Continuation line: append reference info to previous transaction
+                    if rows and not line.startswith("(") and not line.startswith("Page "):
+                        rows[-1]["Description"] += " " + line
                     continue
                 date_str = date_match.group(1)
                 parts = date_str.split("/")
