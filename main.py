@@ -8,6 +8,7 @@ import asyncio
 import io
 import json
 import math
+import re
 import zipfile
 from datetime import datetime
 from typing import List, Optional
@@ -66,10 +67,37 @@ def list_banks():
     return {"supported_banks": SUPPORTED_BANKS}
 
 
+_PASS_PATTERN = re.compile(r"_pass=([^_.]+)", re.IGNORECASE)
+
+
+def _decrypt_pdf_if_needed(contents: bytes, filename: str) -> tuple[bytes, str]:
+    """If the filename contains _pass=<password>, decrypt the PDF and strip the
+    password segment from the filename. Returns (pdf_bytes, clean_filename)."""
+    match = _PASS_PATTERN.search(filename)
+    if not match:
+        return contents, filename
+
+    password = match.group(1)
+    clean_filename = filename[: match.start()] + filename[match.end() :]
+
+    reader = PdfReader(io.BytesIO(contents))
+    if reader.is_encrypted:
+        reader.decrypt(password)
+
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue(), clean_filename
+
+
 async def _parse_pdf_bytes(
     contents: bytes, filename: str, raise_on_error: bool = True
 ) -> dict:
     """Parse raw PDF bytes and return structured result."""
+    contents, filename = _decrypt_pdf_if_needed(contents, filename)
     result = {
         "filename": filename,
         "bank_name": None,
