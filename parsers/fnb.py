@@ -311,13 +311,10 @@ class FNBParser(BaseBankParser):
         if len(found) < 2:
             return None
 
-        # Bank-charges detection:
-        # Known FNB per-transaction fees are all < R30 (R2.50 airtime, R3.68 POS,
-        # R5.00 internet, R8.00 app, R12.00 debit order, R15.00 RTC, R18.80 send).
-        # Running balances for this account are always much larger.
-        BANK_CHARGES_THRESHOLD = 30.0
-        if found[-1][0] < BANK_CHARGES_THRESHOLD:
-            # Last token is a bank-charge fee; second-to-last is the balance
+        # Column layout: Amount[Cr] Balance[Cr] [Accrued_Bank_Charges]
+        # When 3+ numeric tokens are present the last is always the optional
+        # bank-charge column; the second-to-last is the running balance.
+        if len(found) >= 3:
             balance = found[-2][0]
             tx_entries = found[:-2]
         else:
