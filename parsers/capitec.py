@@ -18,7 +18,9 @@ class CapitecParser(BaseBankParser):
 
     # Capitec-specific amount pattern: -1 234.56 or +1 234.56 or 1 234.56
     # Also handles fees with one decimal place like -6.0 or -6.00
-    AMOUNT_PATTERN = re.compile(r"[+-]?\d{1,3}(?:[ ,]\d{3})*\.\d{1,2}")
+    # (?<!\d) prevents grabbing trailing digits from reference numbers
+    # e.g. "4001787814 505.00" won't match as "814 505.00"
+    AMOUNT_PATTERN = re.compile(r"(?<!\d)[+-]?\d{1,3}(?:[ ,]\d{3})*\.\d{1,2}")
     # Also support comma-separated format
     AMOUNT_PATTERN_COMMA = re.compile(r"[+-]?[\d,]+\.\d{1,2}")
     # Date patterns
