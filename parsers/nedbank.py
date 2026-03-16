@@ -13,7 +13,7 @@ class NedbankParser(BaseBankParser):
 
     BANK_NAME = "Nedbank"
     BANK_ID = "nedbank"
-    DETECTION_KEYWORDS = ["nedbank", "statement enquiry", "nedbank.co.za", "transaction listing"]
+    DETECTION_KEYWORDS = ["nedbank", "statement enquiry", "nedbank.co.za", "transaction listing", "enc *", "profile number"]
 
     # Date patterns
     DATE_PATTERN = re.compile(r"(\d{2}/\d{2}/\d{4})")
