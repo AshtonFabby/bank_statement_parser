@@ -129,7 +129,7 @@ class StandardBankParser(BaseBankParser):
     BIZ_INT_AMOUNT_PATTERN = re.compile(r"-?[\d,]+\.\d{2}-?")
     # Business statement (international) line ending: MM DD Balance
     BIZ_INT_END_PATTERN = re.compile(
-        r"(\d{2})\s+(\d{2})\s+(-?[\d,]+\.\d{2})\s*$"
+        r"(\d{2})\s+(\d{2})\s+(-?[\d,]+\.\d{2}-?)\s*$"
     )
 
     def _detect_format(self) -> str:
@@ -143,12 +143,6 @@ class StandardBankParser(BaseBankParser):
         # Check for transactional history format (In/Out columns, space-thousands)
         if re.search(r"In \(R\)|Out \(R\)|Bank fees \(R\)", first_page):
             return "transactional_history"
-        # Transactional history uses space-thousands SA amounts (e.g. "+41 635,00")
-        # Require at least one space-thousands group to avoid matching regular comma-thousands
-        SA_SPACE_THOUSANDS = re.compile(r"[+-]?\d{1,3}(?: \d{3})+,\d{2}")
-        if (re.search(r"standardbank\.co\.za", first_page, re.IGNORECASE)
-                and SA_SPACE_THOUSANDS.search(first_page)):
-            return "transactional_history"
 
         # Current account statement format: columns are Page/Details/Service Fee/Debit/Credit/Date/Balance
         # with YYYYMMDD dates and comma-thousands amounts
@@ -157,13 +151,25 @@ class StandardBankParser(BaseBankParser):
             return "current_account"
 
         # Check for business statement format (Details/Service/Credits/Date/Balance columns)
-        if re.search(r"Details.*Service.*Credits.*Date.*Balance", first_page,
-                      re.DOTALL | re.IGNORECASE):
+        # Also handles split headers where "Details Service Date Balance" is on one line
+        # and "Debits Credits" on the next (Credits appears after Date in text).
+        if re.search(
+            r"Details.*Service.*Credits.*Date.*Balance|Details\s+Service\s+Date\s+Balance",
+            first_page, re.DOTALL | re.IGNORECASE
+        ):
             # Distinguish number format: period-thousands/comma-decimal (e.g. 1.234,56)
             # vs comma-thousands/period-decimal (e.g. 1,234.56)
             if re.search(r"\d{1,3}(?:\.\d{3})+,\d{2}", first_page):
                 return "business_statement"
             return "business_statement_int"
+
+        # Transactional history fallback: SA space-thousands amounts (e.g. "+41 635,00")
+        # Must come after business format checks to avoid false positives on amounts
+        # like "09 04 101,055.54-" where "4 101,05" superficially matches the pattern.
+        SA_SPACE_THOUSANDS = re.compile(r"[+-]?\d{1,3}(?: \d{3})+,\d{2}")
+        if (re.search(r"standardbank\.co\.za", first_page, re.IGNORECASE)
+                and SA_SPACE_THOUSANDS.search(first_page)):
+            return "transactional_history"
 
         return "regular"
 
@@ -385,9 +391,10 @@ class StandardBankParser(BaseBankParser):
                 if not line:
                     continue
 
-                # Detect end of header block (column headers end with "Fee Debits")
+                # Detect end of header block. Some formats have "Fee Debits" on one line;
+                # others split across lines with "Fee" alone as the last header row.
                 if in_header:
-                    if "Fee" in line and ("Debits" in line or "Debit" in line):
+                    if ("Fee" in line and ("Debits" in line or "Debit" in line)) or line.strip() == "Fee":
                         in_header = False
                     continue
 
