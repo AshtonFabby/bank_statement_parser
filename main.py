@@ -22,20 +22,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pypdf import PdfReader, PdfWriter
 
-from starlette.formparsers import MultiPartParser
-
-# Raise the default 1 MB per-field limit so large transaction payloads are accepted.
-# The __init__ default overrides the class attribute, so we must patch __init__.
-_original_init = MultiPartParser.__init__
-
-
-def _patched_init(self, *args, **kwargs):
-    kwargs.setdefault("max_part_size", 1024 * 1024 * 50)  # 50 MB
-    _original_init(self, *args, **kwargs)
-
-
-MultiPartParser.__init__ = _patched_init  # type: ignore[assignment]
-
 from parsers import SUPPORTED_BANKS, detect_bank, get_parser, get_parser_by_id
 from services import (
     calculate_activity_volume,
@@ -455,15 +441,29 @@ def _build_report_from_transactions(transactions: list) -> tuple:
 
 @app.post("/report")
 async def generate_report(
-    transactions: str = Form(...),
+    transactions: Optional[str] = Form(None),
+    transactions_file: Optional[UploadFile] = File(None),
 ):
     """Generate ZIP (Excel + summary PDF) from pre-parsed transaction JSON.
 
     Accepts:
-    - `transactions`: JSON array of transaction records (from /parse/json responses)
+    - `transactions`: JSON array of transaction records (form field, <=1 MB)
+    - `transactions_file`: Same data as a file upload (no size limit)
+    At least one must be provided. File upload takes precedence.
     """
+    raw = None
+    if transactions_file:
+        raw = (await transactions_file.read()).decode()
+    elif transactions:
+        raw = transactions
+
+    if not raw:
+        raise HTTPException(
+            status_code=400, detail="'transactions' or 'transactions_file' must be provided."
+        )
+
     try:
-        records = json.loads(transactions)
+        records = json.loads(raw)
     except json.JSONDecodeError:
         raise HTTPException(
             status_code=400, detail="'transactions' must be a valid JSON array."
@@ -502,22 +502,44 @@ async def generate_report(
 
 @app.post("/generate-full-prevet")
 async def generate_full_prevet(
-    prevet_data: str = Form(...),
+    prevet_data: Optional[str] = Form(None),
+    prevet_data_file: Optional[UploadFile] = File(None),
     links: Optional[str] = Form(None),
     transactions: Optional[str] = Form(None),
+    transactions_file: Optional[UploadFile] = File(None),
 ):
     """Generate a combined PDF with the PreVet form on top and bank analysis below.
 
     Accepts:
-    - `prevet_data`: JSON string of prevet form fields
+    - `prevet_data` / `prevet_data_file`: JSON string of prevet form fields
     - `links`: JSON array of bank statement PDF URLs (optional, slow – downloads & parses)
-    - `transactions`: JSON array of pre-parsed transaction records (optional, fast)
+    - `transactions` / `transactions_file`: JSON array of pre-parsed transaction records (optional, fast)
+    File upload variants bypass the 1 MB multipart field limit.
     If both `transactions` and `links` are provided, `transactions` takes precedence.
     """
+    # Resolve prevet_data from file or form field
+    raw_prevet = None
+    if prevet_data_file:
+        raw_prevet = (await prevet_data_file.read()).decode()
+    elif prevet_data:
+        raw_prevet = prevet_data
+
+    if not raw_prevet:
+        raise HTTPException(
+            status_code=400, detail="'prevet_data' or 'prevet_data_file' must be provided."
+        )
+
     try:
-        form_data = json.loads(prevet_data)
+        form_data = json.loads(raw_prevet)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="'prevet_data' must be valid JSON.")
+
+    # Resolve transactions from file or form field
+    raw_transactions = None
+    if transactions_file:
+        raw_transactions = (await transactions_file.read()).decode()
+    elif transactions:
+        raw_transactions = transactions
 
     # ── 1. Generate PreVet PDF locally ────────────────────────────────────
     prevet_buffer = generate_prevet_pdf(form_data)
@@ -526,10 +548,10 @@ async def generate_full_prevet(
     # ── 2. Generate Bank Analysis PDF ─────────────────────────────────────
     bank_analysis_pdf_bytes: Optional[bytes] = None
 
-    if transactions:
+    if raw_transactions:
         # Fast path: use pre-parsed transactions
         try:
-            records = json.loads(transactions)
+            records = json.loads(raw_transactions)
         except json.JSONDecodeError:
             raise HTTPException(
                 status_code=400, detail="'transactions' must be valid JSON."
