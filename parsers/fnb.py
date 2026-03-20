@@ -1,5 +1,6 @@
 """FNB (First National Bank) statement parser."""
 
+import logging
 import re
 from datetime import datetime
 
@@ -12,6 +13,17 @@ from .utils import (
     extract_year_from_text,
     normalize_amount_string,
 )
+
+logger = logging.getLogger(__name__)
+
+# Optional OCR support – gracefully degrade when tesseract is not installed.
+try:
+    import pytesseract
+    from PIL import Image
+
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
 
 
 class FNBParser(BaseBankParser):
@@ -132,6 +144,114 @@ class FNBParser(BaseBankParser):
             return str(end_year)
         return fallback_year or str(datetime.now().year)
 
+    # ------------------------------------------------------------------
+    # OCR helpers for image-based descriptions
+    # ------------------------------------------------------------------
+
+    # Leading OCR noise: stray chars before the '#' that starts every FNB
+    # fee description.  Handles "l#", "j#", "lf", "[H", "[e", "ié" etc.
+    _OCR_LEADING_NOISE = re.compile(r"^.*?(?=#)")
+    # Trailing pipe/dot artefacts from 1-bit image edges.
+    _OCR_TRAILING_NOISE = re.compile(r"[\s|.]+$")
+
+    @staticmethod
+    def _ocr_image_description(page, line_top: float) -> str | None:
+        """Try to OCR a description image at the given y-position.
+
+        FNB renders certain fee descriptions (e.g. #Excess Item Fee) as
+        bitmap images instead of text.  When we detect a transaction line
+        with no text description we look for an image overlapping the
+        description column at that y-position and OCR it.
+
+        Returns the OCR'd text or None.
+        """
+        if not _OCR_AVAILABLE:
+            return None
+
+        from PIL import ImageOps  # deferred – only needed here
+
+        # Find images in the description column area that overlap this line
+        for img in page.images:
+            # Description column: x0 roughly 30–300, small height (< 35px)
+            if img["x0"] < 30 or img["x0"] > 300:
+                continue
+            if img["srcsize"][1] > 35:
+                continue
+            # Must overlap vertically with the transaction line
+            if abs(img["top"] - line_top) > 6:
+                continue
+
+            try:
+                # Pad horizontally only – vertical padding bleeds into
+                # neighbouring rows and confuses tesseract.
+                bbox = (
+                    max(0, img["x0"] - 5),
+                    img["top"],
+                    min(float(page.width), img["x1"] + 5),
+                    img["bottom"],
+                )
+                cropped = page.crop(bbox)
+                pil_img = cropped.to_image(resolution=800).original
+                # Convert to grayscale and add white border to help tesseract
+                gray = pil_img.convert("L")
+                bordered = ImageOps.expand(gray, border=30, fill=255)
+                raw = pytesseract.image_to_string(
+                    bordered, config="--psm 7"
+                ).strip()
+                if raw:
+                    return FNBParser._clean_ocr_text(raw)
+            except Exception:
+                logger.debug("OCR failed for image at top=%.1f", img["top"])
+                continue
+
+        return None
+
+    @classmethod
+    def _clean_ocr_text(cls, raw: str) -> str:
+        """Remove common OCR artefacts from the raw tesseract output."""
+        # Strip everything before the first '#' (all FNB fee descriptions
+        # start with '#').  Fall back to the generic noise stripper when
+        # no '#' is present.
+        if "#" in raw:
+            text = cls._OCR_LEADING_NOISE.sub("", raw)
+        else:
+            # Tesseract sometimes reads '#' as 'lf' or 'if' — re-add '#'
+            text = re.sub(r"^[^a-zA-Z]+", "", raw)
+            text = re.sub(r"^(?:lf|if)", "#", text)
+        text = cls._OCR_TRAILING_NOISE.sub("", text)
+        # Common OCR mis-reads on these FNB fee images
+        text = re.sub(r"\bltem\b", "Item", text)
+        text = re.sub(r"\blfem\b", "Item", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bENB\b", "FNB", text)
+        return text.strip()
+
+    @staticmethod
+    def _find_line_top(
+        page_words: list[dict],
+        rest_of_line: str,
+    ) -> float | None:
+        """Find the y-position (top) of a transaction line on the page.
+
+        For description-less lines the ``rest_of_line`` is just amounts
+        (e.g. ``"310.00 926,470.39"``).  We locate these amount tokens
+        among the page words to pin-point the exact y-position, which is
+        more reliable than matching by date when the same date appears
+        on many lines.
+        """
+        # Extract the first amount token from rest_of_line to search for
+        amount_match = re.search(r"[\d,]+\.\d{2}", rest_of_line)
+        if not amount_match:
+            return None
+        target = amount_match.group()
+
+        # FNB Amount column: x0 roughly 430–530.  The Accrued Bank
+        # Charges column sits further right (x0 > 550), so we exclude it
+        # to avoid false matches on small values like "4.00".
+        for w in page_words:
+            if w["text"] == target and 300 < w["x0"] < 550:
+                return round(w["top"], 1)
+        return None
+
     def extract_transactions(self) -> pd.DataFrame:
         """Extract transactions from FNB statement.
 
@@ -144,7 +264,7 @@ class FNBParser(BaseBankParser):
         current_year = None
         start_month = start_year = end_month = end_year = None
 
-        for page_text in self._iterate_pages():
+        for page_text, page in self._iterate_pages_with_objects():
             # Extract year from statement period if not yet found (for old format)
             if not current_year:
                 current_year = extract_year_from_text(page_text)
@@ -155,6 +275,9 @@ class FNBParser(BaseBankParser):
                 s_mo, s_yr, e_mo, e_yr = self._extract_statement_period(page_text)
                 if s_yr is not None:
                     start_month, start_year, end_month, end_year = s_mo, s_yr, e_mo, e_yr
+
+            # Pre-extract words once per page (used by _find_line_top)
+            page_words = page.extract_words()
 
             for line in page_text.split("\n"):
                 line = line.strip()
@@ -233,6 +356,16 @@ class FNBParser(BaseBankParser):
                     # Bank Statement format with plain amounts (and optional Cr)
                     row = self._parse_bank_statement_line(rest_of_line, date_str, previous_balance)
                     if row:
+                        # If description is missing, attempt OCR on any
+                        # image rendered in the description column.
+                        if not row.get("Description"):
+                            line_top = self._find_line_top(
+                                page_words, rest_of_line,
+                            )
+                            if line_top is not None:
+                                ocr_desc = self._ocr_image_description(page, line_top)
+                                if ocr_desc:
+                                    row["Description"] = ocr_desc
                         rows.append(row)
                         previous_balance = row["Balance"]
 

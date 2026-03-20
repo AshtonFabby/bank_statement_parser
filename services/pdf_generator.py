@@ -606,7 +606,7 @@ def generate_summary_pdf(
     # ── Service Penalties ─────────────────────────────────────────────────
     elements.append(Paragraph("SERVICE PENALTIES", section_style))
 
-    penalty_keywords = ["Unpaid", "Excess item fees", "Honouring Fee"]
+    penalty_keywords = ["Unpaid", "Excess Item Fee", "Honouring Fee"]
 
     if not df.empty:
         penalty_counts: dict[str, int] = {}

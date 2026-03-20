@@ -70,6 +70,19 @@ class BaseBankParser(ABC):
                     yield text
         self._reset_file()
 
+    def _iterate_pages_with_objects(self):
+        """Generator to iterate through PDF pages, yielding (text, page) tuples.
+
+        Useful when parsers need access to the underlying pdfplumber page
+        object (e.g. for image extraction / OCR).
+        """
+        with pdfplumber.open(self.pdf_file) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    yield text, page
+        self._reset_file()
+
     @classmethod
     def can_parse(cls, text: str) -> bool:
         """Check if this parser can handle the given PDF text."""
