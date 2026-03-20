@@ -184,6 +184,30 @@ def _sanitize_for_json(obj):
     return obj
 
 
+def _standardize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize a transaction DataFrame so Excel and PDF use identical clean data.
+
+    - Coerces Debit/Credit/Balance to numeric (invalid → 0.0)
+    - Parses Date with dayfirst=True, drops rows with unparseable dates
+    - Re-formats Date back to DD/MM/YYYY strings for consistent downstream use
+    """
+    df = df.copy()
+    for col in ("Debit", "Credit", "Balance"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    if "Date" in df.columns:
+        parsed = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+        df = df[parsed.notna()].copy()
+        parsed = parsed[parsed.notna()]
+        df["_parsed_date"] = parsed
+        df["Date"] = parsed.dt.strftime("%d/%m/%Y")
+        df = df.sort_values("_parsed_date").reset_index(drop=True)
+        df = df.drop(columns=["_parsed_date"])
+
+    return df
+
+
 def _deduplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
     """Remove duplicate transactions that arise when a bank statement and transaction
     history overlap in date range.  Two rows are considered duplicates when they share
@@ -287,7 +311,9 @@ async def parse_statement(
             df_with_source["Source"] = result["bank_name"]
             all_dfs.append(df_with_source)
 
-        combined_df = _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
+        combined_df = _standardize_dataframe(
+            _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
+        )
 
         combined_excel_buffer = io.BytesIO()
         combined_df.to_excel(combined_excel_buffer, index=False, engine="openpyxl")
@@ -378,7 +404,9 @@ async def parse_statement_json(
             detail=f"No transactions could be extracted from any file. Errors: {error_details}",
         )
 
-    combined_df = _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
+    combined_df = _standardize_dataframe(
+        _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
+    )
     combined_summary = calculate_summary(combined_df)
     coverage = calculate_coverage(combined_df)
     activity = calculate_activity_volume(combined_df)
@@ -403,15 +431,7 @@ async def parse_statement_json(
 def _build_report_from_transactions(transactions: list) -> tuple:
     """Build combined DataFrame and analysis from pre-parsed transaction records."""
     combined_df = pd.DataFrame(transactions)
-    # Ensure numeric columns
-    for col in ("Debit", "Credit", "Balance"):
-        if col in combined_df.columns:
-            combined_df[col] = pd.to_numeric(combined_df[col], errors="coerce")
-    if "Date" in combined_df.columns:
-        combined_df["Date"] = pd.to_datetime(
-            combined_df["Date"], dayfirst=True, errors="coerce"
-        )
-    combined_df = _deduplicate_transactions(combined_df)
+    combined_df = _standardize_dataframe(_deduplicate_transactions(combined_df))
     summary = calculate_summary(combined_df)
     coverage = calculate_coverage(combined_df)
     activity = calculate_activity_volume(combined_df)
@@ -530,8 +550,10 @@ async def generate_full_prevet(
                     df_with_source["Source"] = result["bank_name"]
                     all_dfs.append(df_with_source)
 
-                combined_df = _deduplicate_transactions(
-                    pd.concat(all_dfs, ignore_index=True)
+                combined_df = _standardize_dataframe(
+                    _deduplicate_transactions(
+                        pd.concat(all_dfs, ignore_index=True)
+                    )
                 )
                 combined_summary = calculate_summary(combined_df)
                 combined_coverage = calculate_coverage(combined_df)

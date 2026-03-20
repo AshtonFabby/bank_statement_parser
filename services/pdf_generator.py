@@ -327,9 +327,10 @@ def generate_summary_pdf(
     elements.append(Paragraph("MONTHLY TURNOVER", section_style))
 
     if not df.empty:
-        dates = pd.to_datetime(df["Date"], dayfirst=True)
+        dates = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
         df_monthly = df.copy()
         df_monthly["Month"] = dates.dt.to_period("M")
+        df_monthly = df_monthly[df_monthly["Month"].notna()]
         monthly_group = (
             df_monthly.groupby("Month")
             .agg(
