@@ -25,7 +25,16 @@ from pypdf import PdfReader, PdfWriter
 from starlette.formparsers import MultiPartParser
 
 # Raise the default 1 MB per-field limit so large transaction payloads are accepted.
-MultiPartParser.max_file_size = 1024 * 1024 * 50  # 50 MB
+# The __init__ default overrides the class attribute, so we must patch __init__.
+_original_init = MultiPartParser.__init__
+
+
+def _patched_init(self, *args, **kwargs):
+    kwargs.setdefault("max_part_size", 1024 * 1024 * 50)  # 50 MB
+    _original_init(self, *args, **kwargs)
+
+
+MultiPartParser.__init__ = _patched_init  # type: ignore[assignment]
 
 from parsers import SUPPORTED_BANKS, detect_bank, get_parser, get_parser_by_id
 from services import (
