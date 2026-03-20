@@ -140,13 +140,26 @@ def calculate_coverage(df: pd.DataFrame) -> CoverageMetrics:
             missing_date_gaps=0,
         )
 
-    dates = pd.to_datetime(df["Date"], dayfirst=True)
-    start_date = dates.min()
-    end_date = dates.max()
+    dates = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    valid = dates.dropna()
+
+    if valid.empty:
+        return CoverageMetrics(
+            start_date=None,
+            end_date=None,
+            days_covered=0,
+            distinct_months=0,
+            transaction_count=len(df),
+            accounts_detected=1,
+            missing_date_gaps=0,
+        )
+
+    start_date = valid.min()
+    end_date = valid.max()
 
     days_covered = (end_date - start_date).days + 1
 
-    months = dates.dt.to_period("M")
+    months = valid.dt.to_period("M")
     distinct_months = months.nunique()
 
     transaction_count = len(df)
@@ -156,7 +169,7 @@ def calculate_coverage(df: pd.DataFrame) -> CoverageMetrics:
     else:
         accounts_detected = 1
 
-    unique_dates = dates.dt.date.nunique()
+    unique_dates = valid.dt.date.nunique()
     missing_date_gaps = days_covered - unique_dates
 
     return CoverageMetrics(
@@ -190,8 +203,8 @@ def calculate_activity_volume(df: pd.DataFrame) -> ActivityVolume:
     credit_count = (df["Credit"] > 0).sum()
     debit_count = (df["Debit"] > 0).sum()
 
-    dates = pd.to_datetime(df["Date"], dayfirst=True)
-    distinct_months = dates.dt.to_period("M").nunique()
+    dates = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce").dropna()
+    distinct_months = dates.dt.to_period("M").nunique() if not dates.empty else 0
 
     if distinct_months > 0:
         avg_credits_per_month = credit_count / distinct_months
@@ -232,9 +245,11 @@ def calculate_revenue(df: pd.DataFrame) -> RevenueMetrics:
     largest_single_credit = df["Credit"].max()
 
     # Monthly aggregation for min/max/volatility
-    dates = pd.to_datetime(df["Date"], dayfirst=True)
+    dates = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
     df_with_month = df.copy()
     df_with_month["Month"] = dates.dt.to_period("M")
+    # Drop rows with unparseable dates so they don't skew monthly stats
+    df_with_month = df_with_month[df_with_month["Month"].notna()]
     monthly_credits = df_with_month.groupby("Month")["Credit"].sum()
 
     distinct_months = len(monthly_credits)
