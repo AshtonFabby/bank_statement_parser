@@ -22,6 +22,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pypdf import PdfReader, PdfWriter
 
+from starlette.formparsers import MultiPartParser
+
+# Raise the default 1 MB per-field limit so large transaction payloads are accepted.
+MultiPartParser.max_file_size = 1024 * 1024 * 50  # 50 MB
+
 from parsers import SUPPORTED_BANKS, detect_bank, get_parser, get_parser_by_id
 from services import (
     calculate_activity_volume,
