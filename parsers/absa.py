@@ -5,7 +5,7 @@ import re
 import pandas as pd
 
 from .base import AccountInfo, BaseBankParser
-from .utils import create_transaction_row, normalize_amount_string
+from .utils import create_transaction_row, normalize_amount_string, parse_date_dd_mmm_yyyy
 
 
 class ABSAParser(BaseBankParser):
@@ -26,6 +26,12 @@ class ABSAParser(BaseBankParser):
     FOOTER_MARKERS = ["SERVICE FEE:", "MNTHLY ACCT FEE", "CHARGE: A =", "* = VAT", "INTEREST RATE"]
     # Lines to skip in Transaction History format
     TH_SKIP_PATTERN = re.compile(r"^\(|^Page\s|^Balance Carried")
+    # BizStart format patterns - uses "D Mon YYYY" dates and comma-decimal amounts
+    BIZSTART_DATE_PATTERN = re.compile(
+        r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\s*(.*)",
+        re.IGNORECASE,
+    )
+    BIZSTART_AMOUNT_PATTERN = re.compile(r"\d{1,3}(?:\s\d{3})*,\d{2}-?")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from ABSA statement."""
@@ -52,8 +58,20 @@ class ABSAParser(BaseBankParser):
             if acc_match:
                 account_number = acc_match.group(1)
 
+        # Try BizStart format: "Account number 91 1595 8244"
+        if not account_number:
+            acc_match = re.search(
+                r"Account\s*number\s+(\d{2}\s+\d{4}\s+\d{4})",
+                first_page,
+                re.IGNORECASE,
+            )
+            if acc_match:
+                account_number = acc_match.group(1)
+
         # Get account type
-        if "cheque account" in first_page.lower():
+        if "bizstart" in first_page.lower():
+            account_type = "BizStart"
+        elif "cheque account" in first_page.lower():
             account_type = "Cheque Account"
         elif "savings account" in first_page.lower():
             account_type = "Savings Account"
@@ -84,6 +102,13 @@ class ABSAParser(BaseBankParser):
         # Cheque account statement format
         if "Cheque account statement" in text:
             return "cheque_statement"
+        # BizStart format uses "D Mon YYYY" dates and comma-decimal amounts
+        if re.search(
+            r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}",
+            text,
+            re.IGNORECASE,
+        ):
+            return "bizstart"
         return "standard"
 
     def _extract_transactions_th(self) -> pd.DataFrame:
@@ -283,16 +308,210 @@ class ABSAParser(BaseBankParser):
 
         return pd.DataFrame(rows)
 
+    def _parse_bizstart_amount(self, amt_str: str) -> float:
+        """Parse BizStart amount (comma decimal, space thousands) to float.
+
+        Examples: '535 285,75' -> 535285.75, '5 000,00-' -> -5000.0
+        """
+        s = amt_str.strip()
+        negative = s.endswith("-")
+        clean = s.rstrip("-").replace(" ", "").replace(",", ".")
+        try:
+            value = float(clean)
+            return -value if negative else value
+        except ValueError:
+            return 0.0
+
+    def _extract_transactions_bizstart(self) -> pd.DataFrame:
+        """Extract transactions from ABSA BizStart statement format.
+
+        Format: D Mon YYYY | Description | Amount | Balance
+        Amounts use space as thousands separator and comma as decimal separator.
+        Service/Transaction/Administration/Notification fees appear on sub-lines.
+        """
+        rows: list[dict] = []
+        pending_date: str | None = None
+        pending_desc: str | None = None
+        pending_amount: float | None = None
+
+        for page_text in self._iterate_pages():
+            lines = page_text.split("\n")
+
+            # Find the column header to know where transactions start on this page
+            start_idx = 0
+            for i, line in enumerate(lines):
+                if "date" in line.lower() and "description" in line.lower():
+                    start_idx = i + 1
+                    break
+
+            for line in lines[start_idx:]:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Skip footer lines
+                if (
+                    "Please turn over" in line
+                    or line.startswith("Page ")
+                    or "Absa Bank Limited" in line
+                    or "DGP002SV" in line
+                    or "Our Privacy Notice" in line
+                ):
+                    continue
+
+                # Check for date line
+                date_match = self.BIZSTART_DATE_PATTERN.match(line)
+                if date_match:
+                    day = date_match.group(1)
+                    month_name = date_match.group(2)
+                    year = date_match.group(3)
+                    rest = date_match.group(4)
+                    date_str = parse_date_dd_mmm_yyyy(day, month_name, year)
+
+                    # Handle Balance Brought Forward
+                    if "Balance Brought Forward" in rest:
+                        amounts = list(self.BIZSTART_AMOUNT_PATTERN.finditer(rest))
+                        if amounts:
+                            balance = self._parse_bizstart_amount(amounts[-1].group())
+                            rows.append(
+                                create_transaction_row(
+                                    "", "Balance Brought Forward", 0.0, 0.0, balance
+                                )
+                            )
+                        pending_date = None
+                        continue
+
+                    # Find amounts in rest of line
+                    amounts = list(self.BIZSTART_AMOUNT_PATTERN.finditer(rest))
+
+                    # Extract description (text before first amount)
+                    if amounts:
+                        desc = rest[: amounts[0].start()].strip()
+                    else:
+                        desc = rest.strip()
+
+                    if len(amounts) >= 2:
+                        # Complete transaction: amount + balance on same line
+                        amt_val = self._parse_bizstart_amount(amounts[-2].group())
+                        balance = self._parse_bizstart_amount(amounts[-1].group())
+                        debit = abs(amt_val) if amt_val < 0 else 0.0
+                        credit = amt_val if amt_val > 0 else 0.0
+                        rows.append(
+                            create_transaction_row(
+                                date_str, desc, debit, credit, balance
+                            )
+                        )
+                        pending_date = None
+                        pending_desc = None
+                        pending_amount = None
+                    else:
+                        # Need fee sub-line for balance
+                        pending_date = date_str
+                        pending_desc = desc
+                        pending_amount = (
+                            self._parse_bizstart_amount(amounts[0].group())
+                            if amounts
+                            else 0.0
+                        )
+                    continue
+
+                # Check for fee sub-line (contains "Fee" and has amounts)
+                if "Fee" in line:
+                    amounts = list(self.BIZSTART_AMOUNT_PATTERN.finditer(line))
+                    if amounts and len(amounts) >= 2:
+                        fee_val = self._parse_bizstart_amount(amounts[-2].group())
+                        balance = self._parse_bizstart_amount(amounts[-1].group())
+                        fee_desc = line[: amounts[0].start()].strip()
+
+                        if pending_date is not None:
+                            if pending_amount is not None and pending_amount != 0.0:
+                                # Main transaction + separate fee
+                                balance_before_fee = balance - fee_val
+                                debit = (
+                                    abs(pending_amount)
+                                    if pending_amount < 0
+                                    else 0.0
+                                )
+                                credit = (
+                                    pending_amount if pending_amount > 0 else 0.0
+                                )
+                                rows.append(
+                                    create_transaction_row(
+                                        pending_date,
+                                        pending_desc,
+                                        debit,
+                                        credit,
+                                        balance_before_fee,
+                                    )
+                                )
+                                # Add fee as separate row
+                                rows.append(
+                                    create_transaction_row(
+                                        pending_date,
+                                        fee_desc,
+                                        abs(fee_val),
+                                        0.0,
+                                        balance,
+                                    )
+                                )
+                            else:
+                                # Fee-only transaction (e.g. "Proof Of Paymt Sms")
+                                rows.append(
+                                    create_transaction_row(
+                                        pending_date,
+                                        pending_desc or fee_desc,
+                                        abs(fee_val),
+                                        0.0,
+                                        balance,
+                                    )
+                                )
+                        else:
+                            # Orphan fee (cross-page continuation)
+                            last_date = rows[-1]["Date"] if rows else ""
+                            rows.append(
+                                create_transaction_row(
+                                    last_date,
+                                    fee_desc,
+                                    abs(fee_val),
+                                    0.0,
+                                    balance,
+                                )
+                            )
+
+                        pending_date = None
+                        pending_desc = None
+                        pending_amount = None
+                        continue
+
+                # Continuation line - skip (reference info, card numbers, etc.)
+
+        # Finalize any remaining pending transaction
+        if pending_date is not None and pending_amount is not None and pending_amount != 0.0:
+            last_balance = rows[-1]["Balance"] if rows else 0.0
+            new_balance = last_balance + pending_amount
+            debit = abs(pending_amount) if pending_amount < 0 else 0.0
+            credit = pending_amount if pending_amount > 0 else 0.0
+            rows.append(
+                create_transaction_row(
+                    pending_date, pending_desc, debit, credit, new_balance
+                )
+            )
+
+        return pd.DataFrame(rows)
+
     def extract_transactions(self) -> pd.DataFrame:
         """Extract transactions from ABSA statement.
 
         Handles multiple formats:
         1. Transaction History (YYYY-MM-DD): Date | Transaction Description | Amount | Balance
-        2. Cheque Statement (DD/MM/YYYY): Date | Transaction Description | Charge | Debit | Credit | Balance
+        2. BizStart (D Mon YYYY): Date | Description | Amount | Balance (comma-decimal)
+        3. Cheque Statement (DD/MM/YYYY): Date | Transaction Description | Charge | Debit | Credit | Balance
         """
         first_page = self._extract_first_page_text()
         format_type = self._detect_format(first_page)
 
         if format_type == "transaction_history":
             return self._extract_transactions_th()
+        if format_type == "bizstart":
+            return self._extract_transactions_bizstart()
         return self._extract_transactions_cheque()
