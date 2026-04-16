@@ -575,6 +575,7 @@ def generate_summary_pdf(
         "Tymebank": ["Tymebank"],
         "Genfin": ["Genfin"],
         "Flow48": ["Elend 48"],
+        "CAPITEC": ["PosSettle CBMPOS"],
     }
 
     if not df.empty:
