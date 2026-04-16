@@ -13,11 +13,18 @@ class ABSAParser(BaseBankParser):
 
     BANK_NAME = "ABSA"
     BANK_ID = "absa"
-    DETECTION_KEYWORDS = ["absa", "cheque account statement", "transaction history"]
+    DETECTION_KEYWORDS = [
+        "absa",
+        "cheque account statement",
+        "transaction history",
+        "business bank esp",
+        "bio case",
+    ]
 
     # Date patterns - ABSA uses multiple formats
     DATE_PATTERN_DMY = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4})")  # DD/MM/YYYY or D/M/YYYY
     DATE_PATTERN_YMD = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")  # YYYY-MM-DD (Transaction History)
+    DATE_PATTERN_YYMMDD = re.compile(r"^\d{4,}\s+(\d{2})(\d{2})(\d{2})\s+")  # YYMMDD (Business Integrator)
     # Amount pattern for cheque statements - space as thousands separator (e.g. "11 236.59-")
     AMOUNT_PATTERN = re.compile(r"-?[\d\s,]+\.\d{2}-?")
     # Amount pattern for Transaction History - comma as thousands separator (e.g. "-6,000.00")
@@ -96,6 +103,9 @@ class ABSAParser(BaseBankParser):
 
     def _detect_format(self, text: str) -> str:
         """Detect which ABSA format is being used."""
+        # Business Integrator format uses YYMMDD dates (e.g., 250901) with entry numbers
+        if re.search(r"^\d{4}\s+\d{6}\s+", text, re.MULTILINE):
+            return "business_integrator"
         # Transaction History format uses YYYY-MM-DD dates
         if re.search(r"\d{4}-\d{2}-\d{2}", text):
             return "transaction_history"
@@ -308,6 +318,148 @@ class ABSAParser(BaseBankParser):
 
         return pd.DataFrame(rows)
 
+    def _extract_transactions_business_integrator(self) -> pd.DataFrame:
+        """Extract transactions from ABSA Business Integrator format.
+
+        Format: EntryNo YYMMDD Description... Site Amount Balance
+        Dates are in YYMMDD format (e.g., 250901 = 1 Sep 2025).
+        Descriptions may span multiple lines.
+        Example:
+          1927 250901 POS PURCHASE (EFFEC 29082025) Kauai Florida SETTLEMENT -125.00 1859290.57
+          Road DURBA
+        """
+        rows: list[dict] = []
+        pending_transaction: dict | None = None
+
+        # Entry number + YYMMDD date pattern
+        entry_date_pattern = re.compile(r"^(\d{4,})\s+(\d{2})(\d{2})(\d{2})\s+(.*)")
+        # Standard amount pattern (e.g., -125.00, 1859290.57)
+        amount_pattern = re.compile(r"-?[\d,]+\.\d{2}")
+
+        for page_text in self._iterate_pages():
+            lines = page_text.split("\n")
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Skip header lines
+                if "BIO CASE" in line:
+                    continue
+                if "Account 4113770534" in line or "Branch BUSINESS BANK ESP" in line:
+                    continue
+                if "Start Date" in line and "End Date" in line:
+                    continue
+                if re.match(r"^Entry\s+Event\s*$", line, re.IGNORECASE):
+                    continue
+                if "No Date Description Site Amount Balance" in line or \
+                   "No Date Description" in line:
+                    continue
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", line):  # Date line like 2025-10-06
+                    continue
+                if re.match(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun),", line):  # Timestamp line
+                    continue
+
+                # Check for transaction line with entry number + date
+                match = entry_date_pattern.match(line)
+                if match:
+                    # Save previous pending transaction if any
+                    if pending_transaction is not None:
+                        rows.append(pending_transaction)
+
+                    entry_no = match.group(1)
+                    year = "20" + match.group(2)  # Convert YY to 20YY
+                    month = match.group(3)
+                    day = match.group(4)
+                    date_str = f"{day}/{month}/{year}"
+                    rest = match.group(5)
+
+                    # Handle Balance B/FORWARD
+                    if "BALANCE B/FORWARD" in rest or "BALANCE B/F" in rest.upper():
+                        amounts = amount_pattern.findall(rest)
+                        if amounts:
+                            balance = normalize_amount_string(amounts[-1])
+                            rows.append(create_transaction_row(
+                                "", "Balance Brought Forward", 0.0, 0.0, balance
+                            ))
+                        pending_transaction = None
+                        continue
+
+                    # Find all amounts in the line
+                    amounts = amount_pattern.findall(rest)
+
+                    if len(amounts) >= 2:
+                        # Complete transaction on single line
+                        amount_val = normalize_amount_string(amounts[-2])
+                        balance = normalize_amount_string(amounts[-1])
+
+                        # Extract description (text before first amount)
+                        first_amt_match = amount_pattern.search(rest)
+                        description = rest[:first_amt_match.start()].strip() if first_amt_match else rest
+
+                        # Remove site indicators from end of description
+                        description = re.sub(r"\s+(SETTLEMENT|HEADOFFICE|CF|RASC|BALLI|DURBA|CINGSTANG|UMHLA|CN)\s*$", "", description).strip()
+
+                        debit = 0.0
+                        credit = 0.0
+                        if amount_val < 0:
+                            debit = abs(amount_val)
+                        else:
+                            credit = amount_val
+
+                        rows.append(create_transaction_row(
+                            date_str, description, debit, credit, balance
+                        ))
+                        pending_transaction = None
+                    else:
+                        # Need continuation lines for amounts
+                        description = rest
+                        pending_transaction = {
+                            "Date": date_str,
+                            "Description": description,
+                            "Debit": 0.0,
+                            "Credit": 0.0,
+                            "Balance": 0.0,
+                        }
+                    continue
+
+                # Continuation line - append to pending transaction description
+                if pending_transaction is not None:
+                    # Check if this line has amounts (completing the transaction)
+                    amounts = amount_pattern.findall(line)
+                    if len(amounts) >= 2:
+                        # Final amounts found
+                        amount_val = normalize_amount_string(amounts[-2])
+                        balance = normalize_amount_string(amounts[-1])
+
+                        # Extract additional description (text before first amount)
+                        first_amt_match = amount_pattern.search(line)
+                        if first_amt_match:
+                            extra_desc = line[:first_amt_match.start()].strip()
+                            if extra_desc:
+                                pending_transaction["Description"] += " " + extra_desc
+
+                        pending_transaction["Balance"] = balance
+                        if amount_val < 0:
+                            pending_transaction["Debit"] = abs(amount_val)
+                        else:
+                            pending_transaction["Credit"] = amount_val
+
+                        rows.append(pending_transaction)
+                        pending_transaction = None
+                    else:
+                        # Just more description text
+                        pending_transaction["Description"] += " " + line
+
+            # End of page - save any pending transaction
+            if pending_transaction is not None:
+                # Try to complete with last known balance if possible
+                rows.append(pending_transaction)
+                pending_transaction = None
+
+        return pd.DataFrame(rows)
+
     def _parse_bizstart_amount(self, amt_str: str) -> float:
         """Parse BizStart amount (comma decimal, space thousands) to float.
 
@@ -503,13 +655,16 @@ class ABSAParser(BaseBankParser):
         """Extract transactions from ABSA statement.
 
         Handles multiple formats:
-        1. Transaction History (YYYY-MM-DD): Date | Transaction Description | Amount | Balance
-        2. BizStart (D Mon YYYY): Date | Description | Amount | Balance (comma-decimal)
-        3. Cheque Statement (DD/MM/YYYY): Date | Transaction Description | Charge | Debit | Credit | Balance
+        1. Business Integrator (YYMMDD): EntryNo YYMMDD Description Site Amount Balance
+        2. Transaction History (YYYY-MM-DD): Date | Transaction Description | Amount | Balance
+        3. BizStart (D Mon YYYY): Date | Description | Amount | Balance (comma-decimal)
+        4. Cheque Statement (DD/MM/YYYY): Date | Transaction Description | Charge | Debit | Credit | Balance
         """
         first_page = self._extract_first_page_text()
         format_type = self._detect_format(first_page)
 
+        if format_type == "business_integrator":
+            return self._extract_transactions_business_integrator()
         if format_type == "transaction_history":
             return self._extract_transactions_th()
         if format_type == "bizstart":
