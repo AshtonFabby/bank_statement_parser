@@ -4,14 +4,24 @@ import re
 from datetime import datetime
 from typing import Optional, List, Tuple
 
-# Common month mapping
+# Common month mapping (English and Afrikaans)
 MONTH_MAP = {
+    # English short forms
     "jan": "01", "feb": "02", "mar": "03", "apr": "04",
     "may": "05", "jun": "06", "jul": "07", "aug": "08",
     "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+    # English full names
     "january": "01", "february": "02", "march": "03", "april": "04",
     "june": "06", "july": "07", "august": "08",
     "september": "09", "october": "10", "november": "11", "december": "12",
+    # Afrikaans short forms (same as English for most)
+    "jan": "01", "feb": "02", "mrt": "03", "apr": "04",
+    "mei": "05", "jun": "06", "jul": "07", "aug": "08",
+    "sep": "09", "okt": "10", "nov": "11", "des": "12",
+    # Afrikaans full names
+    "januarie": "01", "februarie": "02", "maart": "03", "april": "04",
+    "mei": "05", "junie": "06", "julie": "07", "augustus": "08",
+    "september": "09", "oktober": "10", "november": "11", "desember": "12",
 }
 
 # Common regex patterns

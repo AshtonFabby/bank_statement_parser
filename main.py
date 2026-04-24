@@ -11,6 +11,7 @@ import math
 import re
 import zipfile
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import unquote
 
@@ -30,6 +31,7 @@ from services import (
     calculate_summary,
     generate_prevet_pdf,
     generate_summary_pdf,
+    verify_and_correct,
 )
 
 app = FastAPI(
@@ -148,6 +150,8 @@ async def _parse_pdf_bytes(
 
     return {
         "bank_name": account_info.bank,
+        "bank_id": bank_id,
+        "account_number": account_info.account_number,
         "summary": summary,
         "df": df,
         "filename": filename,
@@ -306,10 +310,25 @@ async def parse_statement(
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         all_dfs = []
+        verification_results = []
         for result in results:
-            df_with_source = result["df"].copy()
+            corrected_df, vr = verify_and_correct(
+                result["df"],
+                filename=result["filename"],
+                bank_name=result["bank_name"],
+                bank_id=result.get("bank_id", ""),
+                account_number=result.get("account_number"),
+            )
+            verification_results.append(vr)
+            result["df"] = corrected_df
+            df_with_source = corrected_df.copy()
             df_with_source["Source"] = result["bank_name"]
             all_dfs.append(df_with_source)
+
+            v_filename = Path(result["filename"]).stem + ".verification.json"
+            zip_file.writestr(
+                v_filename, json.dumps(vr.to_dict(), indent=2, default=str)
+            )
 
         combined_df = _standardize_dataframe(
             _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
@@ -331,6 +350,7 @@ async def parse_statement(
             combined_coverage,
             combined_activity,
             combined_revenue,
+            verification_results=verification_results,
         )
         zip_file.writestr(
             f"combined_summary_{timestamp}.pdf", combined_pdf_buffer.getvalue()
@@ -389,11 +409,25 @@ async def parse_statement_json(
 
     all_dfs = []
     errors = []
+    verification_results = []
     for result in all_results:
         if result["error"]:
             errors.append({"filename": result["filename"], "error": result["error"]})
+            verification_results.append({
+                "filename": result["filename"],
+                "error": result["error"],
+            })
         else:
-            df_with_source = result["df"].copy()
+            corrected_df, vr = verify_and_correct(
+                result["df"],
+                filename=result["filename"],
+                bank_name=result["bank_name"],
+                bank_id=result.get("bank_id", ""),
+                account_number=result.get("account_number"),
+            )
+            result["df"] = corrected_df
+            verification_results.append(vr.to_dict())
+            df_with_source = corrected_df.copy()
             df_with_source["Source"] = result["bank_name"]
             all_dfs.append(df_with_source)
 
@@ -418,6 +452,7 @@ async def parse_statement_json(
         "activity_volume": activity.to_dict(),
         "revenue": revenue.to_dict(),
         "transactions": combined_df.to_dict(orient="records"),
+        "verification": verification_results,
         "document_count": total_count,
         "successful_files": len(all_dfs),
     }

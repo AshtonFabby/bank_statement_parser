@@ -12,6 +12,7 @@ from .summary import (
 )
 from .pdf_generator import generate_summary_pdf
 from .prevet_pdf_generator import generate_prevet_pdf
+from .verification import verify_transactions, verify_and_correct, VerificationResult
 
 __all__ = [
     "calculate_summary",
@@ -24,4 +25,7 @@ __all__ = [
     "RevenueMetrics",
     "generate_summary_pdf",
     "generate_prevet_pdf",
+    "verify_transactions",
+    "verify_and_correct",
+    "VerificationResult",
 ]

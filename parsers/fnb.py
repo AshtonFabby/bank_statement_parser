@@ -34,24 +34,49 @@ class FNBParser(BaseBankParser):
     DETECTION_KEYWORDS = ["fnb", "first national bank"]
 
     # Transaction History format: DD MMM YYYY (e.g., "08 Jan 2026")
+    # Supports both English and Afrikaans month names (full and short forms)
     DATE_PATTERN_WITH_YEAR = re.compile(
-        r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\b",
+        r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|"
+        r"Januarie|Februarie|Maart|April|Mei|Junie|Julie|Augustus|September|Oktober|November|Desember|"
+        r"Jan|Feb|Mrt|Apr|Mei|Jun|Jul|Aug|Sep|Okt|Nov|Des)\s+(\d{4})\b",
         re.IGNORECASE
     )
     # Bank Statement format: DD MMM (e.g., "01 Dec")
+    # Supports both English and Afrikaans month names (full and short forms)
     DATE_PATTERN_NO_YEAR = re.compile(
-        r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b",
+        r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|"
+        r"Januarie|Februarie|Maart|April|Mei|Junie|Julie|Augustus|September|Oktober|November|Desember|"
+        r"Jan|Feb|Mrt|Apr|Mei|Jun|Jul|Aug|Sep|Okt|Nov|Des)\b",
         re.IGNORECASE
     )
-    # Transaction History amounts: with CR/DR suffix
-    AMOUNT_PATTERN_CR_DR = re.compile(r"[\d,]+\.\d{2}\s*(?:CR|DR)", re.IGNORECASE)
+    # Transaction History ISO format: YYYY-MM-DD (e.g., "2026-04-13")
+    DATE_PATTERN_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\b", re.MULTILINE)
+    # Transaction History amounts: with CR/DR suffix (English) or KT/DT (Afrikaans)
+    AMOUNT_PATTERN_CR_DR = re.compile(r"[\d,]+\.\d{2}\s*(?:CR|DR|KT|DT)", re.IGNORECASE)
     # Bank Statement amounts: plain numbers
     AMOUNT_PATTERN_PLAIN = re.compile(r"[\d,]+\.\d{2}")
-    # Numeric amount optionally followed by 'Cr' (credit txn or credit-balance marker)
-    _AMOUNT_WITH_OPT_CR = re.compile(r"([\d,]+\.\d{2})(Cr)?", re.IGNORECASE)
+    # Numeric amount optionally followed by 'Cr' or 'Kt' (credit txn or credit-balance marker)
+    # Supports both English (Cr) and Afrikaans (Kt) credit indicators
+    _AMOUNT_WITH_OPT_CR = re.compile(r"([\d,]+\.\d{2})(Cr|Kt)?", re.IGNORECASE)
+    # Signed decimal amount with optional commas (for ISO Transaction History ZAR format)
+    _ISO_AMOUNT = re.compile(r"-?[\d,]+\.\d{2}")
+    # Lines to skip in ISO TH format (headers, footers, noise)
+    # Supports both English and Afrikaans headers
+    _ISO_SKIP_LINES = re.compile(
+        r"(?:TRANSACTION HISTORY|Date Description|Page \d+ of \d+|"
+        r"First National Bank|\(NCRCP|Date:|Reference:|Customer:|"
+        r"Account Number:|Product Type:|"
+        r"TRANSASIE GESKIEDENIS|Datum Beskrywing|Bladsy \d+van \d+|"
+        r"Eerste Nasionale Bank|Datum:|Verwysing:|Klient:|"
+        r"Rekeningnommer:|Produk Tipe:|Transaksies in RAND)",
+        re.IGNORECASE,
+    )
 
     def extract_account_info(self) -> AccountInfo:
-        """Extract account info from FNB statement."""
+        """Extract account info from FNB statement.
+        
+        Supports both English and Afrikaans statement formats.
+        """
         full_text = self._extract_full_text()
         account_number = None
         account_type = None
@@ -63,14 +88,39 @@ class FNBParser(BaseBankParser):
         if selected_account_match:
             account_number = selected_account_match.group(1).strip()
 
-        # Look for "Gold Business Account : 62765962941" pattern
+        # Look for "Gold Business Account : 62765962941" pattern (English)
+        # or "Platinum Business Account : 62116722548" pattern
+        # Account type may be preceded by text like "Customer VAT Registration Number Not Provided"
+        # Also handles Afrikaans "Nie Verskaf" (Not Provided) prefix
         if not account_number:
-            account_match = re.search(
-                r"([\w\s]+Account)\s*[:\s]+(\d{10,12})", full_text
+            # Process line by line to avoid matching across lines
+            for line in full_text.split('\n'):
+                account_match = re.search(
+                    r"(.*?(?:Gold|Platinum|Silver|Business)\s+Account)\s*:\s*(\d{10,12})", 
+                    line, re.IGNORECASE
+                )
+                if account_match:
+                    raw_type = account_match.group(1).strip()
+                    # Clean up - remove common prefixes (English and Afrikaans)
+                    clean_type = re.sub(r'^(?:Customer VAT Registration Number Not Provided\s+|Nie\s+Verskaf\s+|\d+\s+)', '', raw_type, flags=re.IGNORECASE).strip()
+                    account_type = clean_type
+                    account_number = account_match.group(2).strip()
+                    break
+
+        # Look for Afrikaans account patterns: "Nie Verskaf Platinum Business Account : 62116722548"
+        # "Nie Verskaf" means "Not Provided" in Afrikaans - we want to strip it
+        # Use [^\n]* to match only on the same line, not across lines
+        if not account_number:
+            afrikaans_match = re.search(
+                r"(Nie\s+Verskaf\s+)?([^\n]*?Account)\s*[:\s]+(\d{10,12})",
+                full_text, re.IGNORECASE
             )
-            if account_match:
-                account_type = account_match.group(1).strip()
-                account_number = account_match.group(2).strip()
+            if afrikaans_match:
+                raw_type = afrikaans_match.group(2).strip()
+                # Clean up the account type - remove "Nie Verskaf" prefix if present
+                clean_type = re.sub(r'^Nie\s+Verskaf\s+', '', raw_type, flags=re.IGNORECASE).strip()
+                account_type = clean_type
+                account_number = afrikaans_match.group(3).strip()
 
         # Look for Nickname field to use as account type
         if not account_type:
@@ -80,10 +130,18 @@ class FNBParser(BaseBankParser):
             if nickname_match:
                 account_type = nickname_match.group(1).strip()
 
-        # Fallback: look for Account Number field
+        # Fallback: look for Account Number field (English)
         if not account_number:
             acc_num_match = re.search(
                 r"Account\s*Number[:\s]*(\d{10,12})", full_text, re.IGNORECASE
+            )
+            if acc_num_match:
+                account_number = acc_num_match.group(1).strip()
+
+        # Fallback: look for Rekeningnommer field (Afrikaans)
+        if not account_number:
+            acc_num_match = re.search(
+                r"Rekeningnommer[:\s]*(\d{10,12})", full_text, re.IGNORECASE
             )
             if acc_num_match:
                 account_number = acc_num_match.group(1).strip()
@@ -101,9 +159,11 @@ class FNBParser(BaseBankParser):
     def _extract_statement_period(self, text: str) -> tuple:
         """Extract start/end month+year from statement period text.
 
+        Supports both English and Afrikaans formats.
         Returns (start_month, start_year, end_month, end_year) integers,
         or (None, None, None, None) if not found.
         """
+        # English format: "Statement Period : 31 July 2025 to 31 August 2025"
         period_match = re.search(
             r"Statement\s+Period\s*[:\s]*"
             r"(\d{1,2})\s+(January|February|March|April|May|June|July|August|"
@@ -119,6 +179,24 @@ class FNBParser(BaseBankParser):
             end_month = int(MONTH_MAP.get(period_match.group(5).lower()[:3], "01"))
             end_year = int(period_match.group(6))
             return start_month, start_year, end_month, end_year
+
+        # Afrikaans format: "Staat Periode : 31 Julie 2025 tot 30 Augustus 2025"
+        afrikaans_period_match = re.search(
+            r"Staat\s+Periode\s*[:\s]*"
+            r"(\d{1,2})\s+(Januarie|Februarie|Maart|April|Mei|Junie|Julie|Augustus|"
+            r"September|Oktober|November|Desember)\s+(\d{4})"
+            r"\s+tot\s+"
+            r"(\d{1,2})\s+(Januarie|Februarie|Maart|April|Mei|Junie|Julie|Augustus|"
+            r"September|Oktober|November|Desember)\s+(\d{4})",
+            text, re.IGNORECASE
+        )
+        if afrikaans_period_match:
+            start_month = int(MONTH_MAP.get(afrikaans_period_match.group(2).lower(), "01"))
+            start_year = int(afrikaans_period_match.group(3))
+            end_month = int(MONTH_MAP.get(afrikaans_period_match.group(5).lower(), "01"))
+            end_year = int(afrikaans_period_match.group(6))
+            return start_month, start_year, end_month, end_year
+
         return None, None, None, None
 
     def _assign_year(
@@ -255,16 +333,24 @@ class FNBParser(BaseBankParser):
     def extract_transactions(self) -> pd.DataFrame:
         """Extract transactions from FNB statement.
 
-        Handles both formats:
-        1. Transaction History: DD MMM YYYY with CR/DR amounts
+        Handles three formats:
+        1. Transaction History (CR/DR): DD MMM YYYY with CR/DR amounts
         2. Bank Statement: DD MMM with plain amounts
+        3. Transaction History (ISO): YYYY-MM-DD with ZAR amounts
         """
         rows = []
         previous_balance = None
         current_year = None
         start_month = start_year = end_month = end_year = None
+        iso_mode = False
+        iso_desc_fragments: list[str] = []
 
         for page_text, page in self._iterate_pages_with_objects():
+            # Detect ISO Transaction History format early
+            if not iso_mode:
+                if self.DATE_PATTERN_ISO.search(page_text) and "ZAR" in page_text:
+                    iso_mode = True
+
             # Extract year from statement period if not yet found (for old format)
             if not current_year:
                 current_year = extract_year_from_text(page_text)
@@ -282,8 +368,9 @@ class FNBParser(BaseBankParser):
             for line in page_text.split("\n"):
                 line = line.strip()
 
-                # Skip header rows
                 if not line:
+                    continue
+                if self._ISO_SKIP_LINES.search(line):
                     continue
                 if "Date" in line and "Description" in line:
                     continue
@@ -292,15 +379,46 @@ class FNBParser(BaseBankParser):
                 if "Service Fee" in line and "Closing Balance" in line:
                     continue
 
-                # Handle Opening/Statement Balance
-                if "opening balance" in line.lower() or "statement balance" in line.lower():
+                # Handle Opening/Statement Balance (English and Afrikaans)
+                line_lower = line.lower()
+                if ("opening balance" in line_lower or "statement balance" in line_lower or
+                    "openingsaldo" in line_lower):
                     amounts = self.AMOUNT_PATTERN_PLAIN.findall(line)
                     if amounts:
                         balance = self._clean_amount(amounts[0])
+                        # Check for Dr/Cr/Dt/Kt suffix right after the first amount.
+                        # FNB format: "Opening Balance 2,843.13Dr" or "... 5,000.00Cr"
+                        # Afrikaans: "Openingsaldo 373,625.17Dt" or "... 384,020.98Kt"
+                        after_amount = line[line.find(amounts[0]) + len(amounts[0]):].lstrip()
+                        after_lower = after_amount.lower()
+                        # Cr/Kt = credit balance (positive), Dr/Dt = debit balance (negative)
+                        is_cr_balance = after_lower.startswith("cr") or after_lower.startswith("kt")
+                        if not is_cr_balance:
+                            balance = -balance
                         rows.append(create_transaction_row(
                             "", "Opening Balance", 0.0, 0.0, balance
                         ))
                         previous_balance = balance
+                    continue
+
+                # Try ISO Transaction History format first if detected
+                iso_match = self.DATE_PATTERN_ISO.match(line)
+                if iso_mode and iso_match and "ZAR" in line:
+                    iso_desc_fragments_str = " ".join(iso_desc_fragments).strip()
+                    iso_desc_fragments.clear()
+                    row = self._parse_iso_transaction_line(
+                        line, iso_match, iso_desc_fragments_str
+                    )
+                    if row:
+                        rows.append(row)
+                        previous_balance = row["Balance"]
+                    continue
+
+                # Collect description fragments for ISO mode (non-date lines
+                # that precede a date line belong to the next transaction)
+                if iso_mode and not self.DATE_PATTERN_WITH_YEAR.match(line) \
+                        and not self.DATE_PATTERN_NO_YEAR.match(line):
+                    iso_desc_fragments.append(line)
                     continue
 
                 # Try matching with year first (Transaction History format)
@@ -369,13 +487,85 @@ class FNBParser(BaseBankParser):
                         rows.append(row)
                         previous_balance = row["Balance"]
 
+        # ISO Transaction History lists rows in reverse chronological order
+        # (newest first). Reverse them so the DataFrame is chronological.
+        if iso_mode and rows:
+            rows.reverse()
+
         return pd.DataFrame(rows)
 
+    def _parse_iso_transaction_line(
+        self, line: str, date_match: re.Match, prefix_description: str
+    ) -> dict | None:
+        """Parse a line from ISO Transaction History format (YYYY-MM-DD ZAR).
+
+        Format: YYYY-MM-DD [Description] ZAR [-]Amount ServiceFee Balance
+        Example: 2026-04-11 material mbk01 ZAR -3000.00 8.00 924.91
+        Example: 2026-04-13 ZAR 80.00 0.00 1004.91
+
+        Negative amounts are debits, positive amounts are credits.
+        Service fees are additional debits that reduce the running balance.
+        Multi-line descriptions are passed via prefix_description.
+        """
+        year = date_match.group(1)
+        month = date_match.group(2)
+        day = date_match.group(3)
+        date_str = f"{day}/{month}/{year}"
+
+        # Everything after the date
+        rest = line[date_match.end():].strip()
+
+        # Split at "ZAR" to separate description from amounts
+        zar_split = rest.split("ZAR", 1)
+        if len(zar_split) < 2:
+            return None
+
+        inline_desc = zar_split[0].strip()
+        amount_part = zar_split[1].strip()
+
+        # Combine prefix (multi-line) description with inline description
+        parts = []
+        if prefix_description:
+            parts.append(prefix_description)
+        if inline_desc:
+            parts.append(inline_desc)
+        description = " ".join(parts) or None
+
+        # Extract all signed decimal amounts after ZAR
+        # Format: [-]Amount ServiceFee Balance
+        amounts = self._ISO_AMOUNT.findall(amount_part)
+        if len(amounts) < 2:
+            return None
+
+        amount_val = self._clean_amount(amounts[0])
+        balance = self._clean_amount(amounts[-1])
+
+        # Service fee: present when there are 3+ amounts (between Amount and Balance)
+        service_fee = 0.0
+        if len(amounts) >= 3:
+            service_fee = self._clean_amount(amounts[1])
+
+        # Determine debit/credit from the sign of the raw amount string
+        raw_amount_str = amounts[0].strip()
+        if raw_amount_str.startswith("-"):
+            # Debit: do NOT add service fee to debit (balance column excludes it)
+            debit = abs(amount_val)
+            credit = 0.0
+        else:
+            # Credit: service fee is a separate debit
+            credit = amount_val
+            debit = service_fee
+
+        return create_transaction_row(date_str, description, debit, credit, balance)
+
     def _parse_transaction_history_line(self, rest_of_line: str, date_str: str) -> dict:
-        """Parse a line from Transaction History format (with CR/DR).
+        """Parse a line from Transaction History format (with CR/DR or KT/DT).
+
+        Supports both English (CR/DR) and Afrikaans (KT/DT - Krediet/Debet) formats.
 
         Format: Description Service_Fee Amount Balance
         Example: CITIBANK IQVIA1004848 0.00 284.77 CR 0.00 CR
+        Afrikaans Example: GRANIET 15.00 -3,240.00 DR -382,371.31 DR
         """
         # Find all amounts with CR/DR suffix
         amounts = self.AMOUNT_PATTERN_CR_DR.findall(rest_of_line)
@@ -416,12 +606,15 @@ class FNBParser(BaseBankParser):
     def _parse_bank_statement_line(self, rest_of_line: str, date_str: str, previous_balance: float) -> dict:
         """Parse a line from Bank Statement format (plain amounts).
 
+        Supports both English and Afrikaans formats.
+
         FNB bank statement column layout:
-          Description  Amount[Cr]  Balance[Cr]  [Accrued_Bank_Charges]
+          Description  Amount[Cr/Kt]  Balance[Cr/Kt]  [Accrued_Bank_Charges]
 
         Key rules:
-        - A 'Cr' suffix on the TRANSACTION AMOUNT token = credit (money in).
-        - A 'Cr' suffix on the BALANCE token = account has a positive/credit
+        - A 'Cr' (English) or 'Kt' (Afrikaans) suffix on the TRANSACTION AMOUNT
+          token = credit (money in).
+        - A 'Cr'/'Kt' suffix on the BALANCE token = account has a positive/credit
           balance. This does NOT make the transaction a credit.
         - The optional 'Accrued Bank Charges' column is a small fixed fee
           (always < R30) appended at the end for fee-bearing transactions.
@@ -449,21 +642,31 @@ class FNBParser(BaseBankParser):
         # bank-charge column; the second-to-last is the running balance.
         if len(found) >= 3:
             balance = found[-2][0]
+            balance_has_cr = found[-2][1]
             tx_entries = found[:-2]
         else:
             balance = found[-1][0]
+            balance_has_cr = found[-1][1]
             tx_entries = found[:-1]
 
         if not tx_entries:
             return None
 
+        # FNB Bank Statement uses Dr/Cr (English) or Dt/Kt (Afrikaans) sign convention on the balance:
+        #   Cr/Kt suffix = credit balance (positive, money in your account)
+        #   No Cr/Kt suffix = debit balance (negative, money you owe / overdraft)
+        # Convert Dr/Dt balances to negative so that balance progression math
+        # works correctly: previous_balance + credit - debit = new_balance.
+        if not balance_has_cr:
+            balance = -balance
+
         # Description: everything before the first numeric token
         description = rest_of_line[: found[0][2]].strip() or None
 
         # Debit / credit determination:
-        # Use the 'Cr' flag of the TRANSACTION AMOUNT token only.
+        # Use the 'Cr'/'Kt' flag of the TRANSACTION AMOUNT token only.
         # When the account has a positive balance the running balance also carries
-        # 'Cr' -- that must not be confused with an incoming credit transaction.
+        # 'Cr'/'Kt' -- that must not be confused with an incoming credit transaction.
         tx_val, tx_has_cr, _ = tx_entries[-1]
         if tx_has_cr:
             debit, credit = 0.0, tx_val
@@ -473,19 +676,24 @@ class FNBParser(BaseBankParser):
         return create_transaction_row(date_str, description, debit, credit, balance)
 
     def _parse_amount_cr_dr(self, amount_str: str) -> tuple[float, bool]:
-        """Parse amount with CR/DR suffix.
+        """Parse amount with CR/DR/KT/DT suffix.
+
+        Supports both English (CR/DR) and Afrikaans (KT/DT) formats.
 
         Args:
-            amount_str: Amount string with CR or DR suffix (e.g., "284.77 CR", "1,178.06 DR")
+            amount_str: Amount string with CR/DR/KT/DT suffix (e.g., "284.77 CR", "1,178.06 DR", "5,000.00 Kt")
 
         Returns:
             Tuple of (absolute value, is_credit)
         """
         amount_str = amount_str.strip().upper()
-        is_credit = "CR" in amount_str
+        # Check for credit indicators: CR (English) or KT (Afrikaans - Krediet)
+        is_credit = "CR" in amount_str or "KT" in amount_str
 
-        # Remove CR/DR and clean the amount
-        clean_str = amount_str.replace("CR", "").replace("DR", "").replace(",", "").strip()
+        # Remove CR/DR/KT/DT and clean the amount
+        clean_str = (amount_str.replace("CR", "").replace("DR", "")
+                     .replace("KT", "").replace("DT", "")
+                     .replace(",", "").strip())
 
         try:
             value = abs(float(clean_str))

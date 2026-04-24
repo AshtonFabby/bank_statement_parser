@@ -175,6 +175,7 @@ def generate_summary_pdf(
     coverage: CoverageMetrics | None = None,
     activity: ActivityVolume | None = None,
     revenue: RevenueMetrics | None = None,
+    verification_results: list | None = None,
 ) -> io.BytesIO:
     """Generate a summary PDF report.
 
@@ -630,6 +631,80 @@ def generate_summary_pdf(
             elements.append(
                 Paragraph("No service penalties detected.", styles["Normal"])
             )
+
+    # ── Parsing Accuracy ────────────────────────────────────────────────────
+    if verification_results:
+        elements.append(Paragraph("PARSING ACCURACY", section_style))
+
+        ACC_GREEN = colors.HexColor("#22c55e")
+        ACC_AMBER = colors.HexColor("#f59e0b")
+        ACC_RED = colors.HexColor("#ef4444")
+
+        acc_data = [["File", "Bank", "Accuracy", "Verified", "Failing", "Total Failures"]]
+        acc_colors = []
+        tf_colors = []
+
+        for vr in verification_results:
+            if hasattr(vr, "accuracy_percentage"):
+                acc_pct = vr.accuracy_percentage
+                verified = vr.verified_transactions
+                failing = vr.failing_transactions
+                tf = vr.total_failures
+                fname = vr.filename or ""
+                bname = vr.bank_name or ""
+            else:
+                acc_pct = vr.get("accuracy_percentage")
+                verified = vr.get("verified_transactions", 0)
+                failing = vr.get("failing_transactions", 0)
+                tf = vr.get("total_failures", 0)
+                fname = vr.get("filename", "")
+                bname = vr.get("bank_name", "")
+
+            acc_display = f"{acc_pct}%" if acc_pct is not None else "N/A"
+            acc_data.append([fname, bname, acc_display, str(verified), str(failing), str(tf)])
+
+            if acc_pct is None:
+                acc_colors.append(ACC_RED)
+            elif acc_pct >= 99:
+                acc_colors.append(ACC_GREEN)
+            elif acc_pct >= 95:
+                acc_colors.append(ACC_AMBER)
+            else:
+                acc_colors.append(ACC_RED)
+
+            tf_colors.append(ACC_RED if tf > 0 else TEXT_DARK)
+
+        acc_table = Table(
+            acc_data,
+            colWidths=[1.7 * inch, 0.8 * inch, 0.8 * inch, 0.75 * inch, 0.65 * inch, 1.0 * inch],
+        )
+        acc_commands = [
+            ("BACKGROUND", (0, 0), (-1, 0), HEADER_BG),
+            ("TEXTCOLOR", (0, 0), (-1, 0), GREEN_SECONDARY),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("TOPPADDING", (0, 0), (-1, 0), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 9),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_COLOR),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("TEXTCOLOR", (0, 1), (-1, -1), TEXT_DARK),
+            ("TOPPADDING", (0, 1), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 7),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, ROW_ALT]),
+            ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+            ("TEXTCOLOR", (0, 1), (0, -1), colors.HexColor("#4a5568")),
+        ]
+        for i, (ac, tfc) in enumerate(zip(acc_colors, tf_colors), start=1):
+            acc_commands.append(("TEXTCOLOR", (2, i), (2, i), ac))
+            acc_commands.append(("FONTNAME", (2, i), (2, i), "Helvetica-Bold"))
+            acc_commands.append(("TEXTCOLOR", (5, i), (5, i), tfc))
+            if tfc == ACC_RED:
+                acc_commands.append(("FONTNAME", (5, i), (5, i), "Helvetica-Bold"))
+
+        acc_table.setStyle(TableStyle(acc_commands))
+        elements.append(RoundedTable(acc_table))
 
     doc.build(elements)
     buffer.seek(0)

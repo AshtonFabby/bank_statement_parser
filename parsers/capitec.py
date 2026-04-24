@@ -18,7 +18,7 @@ class CapitecParser(BaseBankParser):
 
     # Capitec-specific amount pattern: -1 234.56 or +1 234.56 or 1 234.56
     # Also handles fees with one decimal place like -6.0 or -6.00
-    # (?<!\d) prevents grabbing trailing digits from reference numbers
+    # (?<!\d) p      revents grabbing trailing digits from reference numbers
     # e.g. "4001787814 505.00" won't match as "814 505.00"
     AMOUNT_PATTERN = re.compile(r"(?<!\d)[+-]?\d{1,3}(?:[ ,]\d{3})*\.\d{1,2}")
     # Also support comma-separated format
@@ -99,7 +99,10 @@ class CapitecParser(BaseBankParser):
         Returns dict with keys: post_date, trans_date, description, reference, fees, amount, balance
         """
         indices = {}
-        clean = [(i, (c.strip().lower().replace("\n", " ") if c else "")) for i, c in enumerate(header_row)]
+        clean = [
+            (i, (c.strip().lower().replace("\n", " ") if c else ""))
+            for i, c in enumerate(header_row)
+        ]
 
         for i, val in clean:
             if "post" in val and "date" in val:
@@ -171,7 +174,10 @@ class CapitecParser(BaseBankParser):
                     continue
 
                 # Handle "Balance brought forward"
-                if "balance brought forward" in combined or "balance b/forward" in combined:
+                if (
+                    "balance brought forward" in combined
+                    or "balance b/forward" in combined
+                ):
                     if balance_idx is not None and balance_idx < len(cells):
                         balance = self._parse_cell_amount(cells[balance_idx])
                     else:
@@ -183,9 +189,11 @@ class CapitecParser(BaseBankParser):
                                 if balance != 0.0:
                                     break
                     if balance != 0.0:
-                        rows.append(create_transaction_row(
-                            "", "Balance brought forward", 0.0, 0.0, balance
-                        ))
+                        rows.append(
+                            create_transaction_row(
+                                "", "Balance brought forward", 0.0, 0.0, balance
+                            )
+                        )
                         found_data = True
                     continue
 
@@ -194,7 +202,9 @@ class CapitecParser(BaseBankParser):
                     continue
 
                 # Check if post date cell is a date (DD/MM/YY)
-                post_date_cell = cells[post_date_idx] if post_date_idx < len(cells) else ""
+                post_date_cell = (
+                    cells[post_date_idx] if post_date_idx < len(cells) else ""
+                )
                 if not post_date_cell or not self.SHORT_DATE_CELL.match(post_date_cell):
                     continue
 
@@ -251,7 +261,11 @@ class CapitecParser(BaseBankParser):
                     else:
                         credit = diff
 
-                rows.append(create_transaction_row(date_str, description, debit, credit, balance))
+                rows.append(
+                    create_transaction_row(
+                        date_str, description, debit, credit, balance
+                    )
+                )
                 found_data = True
 
         return found_data
@@ -275,13 +289,20 @@ class CapitecParser(BaseBankParser):
                 continue
 
             # Handle "Balance brought forward" - can have different formats
-            if "balance brought forward" in line.lower() or "balance b/forward" in line.lower():
+            if (
+                "balance brought forward" in line.lower()
+                or "balance b/forward" in line.lower()
+            ):
                 amounts = self.AMOUNT_PATTERN.findall(line)
                 if not amounts:
                     amounts = self.AMOUNT_PATTERN_COMMA.findall(line)
                 if amounts:
                     balance = self._clean_amount(amounts[-1])
-                    rows.append(create_transaction_row("", "Balance brought forward", 0.0, 0.0, balance))
+                    rows.append(
+                        create_transaction_row(
+                            "", "Balance brought forward", 0.0, 0.0, balance
+                        )
+                    )
                 continue
 
             # Handle "Interest Rate" line - skip
@@ -295,7 +316,7 @@ class CapitecParser(BaseBankParser):
 
             # Use Post Date as the transaction date
             date_str = self._convert_short_year(business_match.group(1))
-            rest_of_line = line[business_match.end():].strip()
+            rest_of_line = line[business_match.end() :].strip()
 
             # Find all amounts in the line
             amounts = self.AMOUNT_PATTERN.findall(rest_of_line)
@@ -309,7 +330,7 @@ class CapitecParser(BaseBankParser):
             if not first_amt_match:
                 first_amt_match = self.AMOUNT_PATTERN_COMMA.search(rest_of_line)
             if first_amt_match:
-                description = rest_of_line[:first_amt_match.start()].strip()
+                description = rest_of_line[: first_amt_match.start()].strip()
             else:
                 description = rest_of_line
 
@@ -328,7 +349,9 @@ class CapitecParser(BaseBankParser):
                 fees = abs(self._clean_amount(fees_str))
                 amount_val = self._clean_amount(amount_str)
 
-                if amount_str.startswith("+") or (not amount_str.startswith("-") and amount_val > 0):
+                if amount_str.startswith("+") or (
+                    not amount_str.startswith("-") and amount_val > 0
+                ):
                     credit = abs(amount_val)
                 else:
                     debit = abs(amount_val)
@@ -369,7 +392,9 @@ class CapitecParser(BaseBankParser):
                 else:
                     credit = diff
 
-            rows.append(create_transaction_row(date_str, description, debit, credit, balance))
+            rows.append(
+                create_transaction_row(date_str, description, debit, credit, balance)
+            )
 
     def _parse_standard_format(self, page_text: str, rows: list) -> None:
         """Parse standard personal account format.
@@ -395,7 +420,9 @@ class CapitecParser(BaseBankParser):
                     amounts = self.AMOUNT_PATTERN_COMMA.findall(line)
                 if amounts:
                     balance = self._clean_amount(amounts[-1])
-                    rows.append(create_transaction_row("", "Opening Balance", 0.0, 0.0, balance))
+                    rows.append(
+                        create_transaction_row("", "Opening Balance", 0.0, 0.0, balance)
+                    )
                 continue
 
             # Standard format: DD/MM/YYYY
@@ -417,7 +444,7 @@ class CapitecParser(BaseBankParser):
             rest_of_line = line[11:].strip()
             first_amt_match = re.search(r"[+-]?[\d,\s]+\.\d{2}", rest_of_line)
             if first_amt_match:
-                description = rest_of_line[:first_amt_match.start()].strip()
+                description = rest_of_line[: first_amt_match.start()].strip()
             else:
                 description = rest_of_line
 
@@ -469,7 +496,9 @@ class CapitecParser(BaseBankParser):
                     else:
                         credit = diff
 
-            rows.append(create_transaction_row(date, description, debit, credit, balance))
+            rows.append(
+                create_transaction_row(date, description, debit, credit, balance)
+            )
 
     def _detect_format(self) -> str:
         """Detect statement format (business vs standard)."""
@@ -500,7 +529,10 @@ class CapitecParser(BaseBankParser):
                             for row in table:
                                 if row:
                                     combined = " ".join(c for c in row if c).lower()
-                                    if "money in" in combined and "money out" in combined:
+                                    if (
+                                        "money in" in combined
+                                        and "money out" in combined
+                                    ):
                                         self._reset_file()
                                         return "standard"
                                     if "post" in combined and "date" in combined:
