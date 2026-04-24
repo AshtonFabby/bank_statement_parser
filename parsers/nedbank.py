@@ -18,9 +18,11 @@ class NedbankParser(BaseBankParser):
     # Date patterns
     DATE_PATTERN = re.compile(r"(\d{2}/\d{2}/\d{4})")
     DATE_PATTERN_YMD = re.compile(r"^(\d{2})/(\d{2})/(\d{4})")  # Start of line
-    # Amount pattern - handles comma separators and optional thousands space separator
+    # Amount pattern - handles comma separators
     # Negative lookbehind for digits prevents matching partial phone numbers
-    AMOUNT_PATTERN = re.compile(r"(?<!\d)-?\d{1,3}(?:[,\s]\d{3})*\.\d{2}(?!\d)")
+    # Note: Only commas are allowed as thousand separators, not spaces
+    # This prevents "2 300,000.00" from being matched as a single amount
+    AMOUNT_PATTERN = re.compile(r"(?<!\d)-?\d{1,3}(?:,\d{3})*\.\d{2}(?!\d)")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Nedbank statement."""
@@ -137,6 +139,37 @@ class NedbankParser(BaseBankParser):
                     continue
                 if "BROUGHT FORWARD" in line or "CARRIED FORWARD" in line:
                     continue
+                # Handle ATM CASH companion lines (e.g., "ATM CASH R10,800.00 FEE 69.60*")
+                # These lines show ATM withdrawal details and may contain a separate fee
+                # Pattern: "ATM CASH R{amount} FEE {fee} {balance}"
+                # Note: "ATM CASH TRANSACTION FEE" lines are real fee transactions and processed normally
+                if "ATM CASH R" in line and "FEE" in line and "TRANSACTION FEE" not in line:
+                    # Extract fee amount if present (marked with asterisk for non-zero fees)
+                    fee_match = re.search(r'FEE\s+(\d{1,3}(?:,\d{3})*\.\d{2})\*', line)
+                    if fee_match:
+                        # Non-zero fee - extract it as a separate transaction
+                        fee_amount = self._clean_amount(fee_match.group(1))
+                        # Get balance from the end of the line
+                        amounts = self.AMOUNT_PATTERN.findall(line)
+                        if amounts:
+                            balance = self._clean_amount(amounts[-1])
+                            # Try date at start of line first, then with prefix pattern
+                            date_match = self.DATE_PATTERN.match(line)
+                            if date_match:
+                                date_str = date_match.group(1)
+                            else:
+                                # Try prefix pattern: "000038 11/08/2025"
+                                txn_date_match = re.search(r"^\d{3,6}\s+(\d{2}/\d{2}/\d{4})", line)
+                                if txn_date_match:
+                                    date_str = txn_date_match.group(1)
+                                else:
+                                    date_str = None
+                            if date_str:
+                                rows.append(create_transaction_row(
+                                    date_str, "ATM CASH FEE", fee_amount, 0.0, balance
+                                ))
+                    # Skip the companion line (don't process as main transaction)
+                    continue
 
                 # Find date in line - different formats have dates in different positions
                 date_str = None
@@ -182,6 +215,29 @@ class NedbankParser(BaseBankParser):
                     description = rest_of_line[:first_amount_match.start()].strip()
                 else:
                     description = rest_of_line
+
+                # Handle VAT lines: "VAT 26/09-27/10 = R325.24 0.00 92,479.05"
+                # The R{amount} is part of the description, not a transaction amount
+                # The actual transaction amount is 0.00 (no actual debit/credit)
+                is_vat_line = "VAT" in description and "= R" in line
+                if is_vat_line:
+                    # Include the R{amount} in the description
+                    vat_amount_match = re.search(r'=\s*R\d{1,3}(?:,\d{3})*\.\d{2}', line)
+                    if vat_amount_match:
+                        description = rest_of_line[:vat_amount_match.end()].strip()
+                    # For VAT lines, the transaction amount is 0.00, so only use last amount (balance)
+                    if len(cleaned_amounts) >= 2:
+                        # Remove the VAT amount from cleaned_amounts, keep only 0.00 and balance
+                        # Find which amount is the VAT amount in the description
+                        new_amounts = []
+                        for amt in amounts:
+                            amt_val = self._clean_amount(amt)
+                            # Skip amounts that appear in the VAT description part
+                            if f"R{amt}" not in description:
+                                new_amounts.append(amt_val)
+                        if len(new_amounts) >= 1:
+                            cleaned_amounts = [abs(a) for a in new_amounts]
+                            is_negative = [a < 0 for a in new_amounts]
 
                 # Balance is always last
                 balance = cleaned_amounts[-1] if cleaned_amounts else 0.0

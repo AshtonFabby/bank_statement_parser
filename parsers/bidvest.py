@@ -13,12 +13,15 @@ class BidvestParser(BaseBankParser):
 
     BANK_NAME = "Bidvest Bank"
     BANK_ID = "bidvest"
-    DETECTION_KEYWORDS = ["bidvest"]
+    DETECTION_KEYWORDS = [
+        "bidvest",
+        "branch code:462005",
+        "craft hardware",
+        "vilbes investments",
+    ]
 
     # Date pattern YYYY/MM/DD
     DATE_PATTERN = re.compile(r"^(\d{4}/\d{2}/\d{2})")
-    # Amount pattern - handles spaces as thousands separator and negative amounts
-    AMOUNT_PATTERN = re.compile(r"-?\s*[\d\s,]+\.\d{2}")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Bidvest Bank statement."""
@@ -69,46 +72,87 @@ class BidvestParser(BaseBankParser):
             return "account_statement"
         return "account_statement"
 
+    def _extract_amounts_from_end(self, text: str, format_type: str):
+        """Extract amounts from the end of a line.
+        
+        Returns a list of (amount_string, is_negative) tuples from the end of the line.
+        Only matches amounts preceded by whitespace to avoid matching reference numbers.
+        """
+        # Pattern: whitespace, optional minus, optional spaces, digits with spaces/commas, decimal
+        # Must be followed by end of string or another amount
+        amount_pattern = re.compile(r'\s(-?\s*[\d\s,]+\.\d{2})(?=\s|$)')
+        matches = list(amount_pattern.finditer(text))
+        
+        result = []
+        for m in matches:
+            amt_str = m.group(1).strip()
+            is_negative = amt_str.startswith('-') or '- ' in m.group()
+            result.append((amt_str, is_negative, m.start(), m.end()))
+        
+        return result
+
     def extract_transactions(self) -> pd.DataFrame:
         """Extract transactions from Bidvest Bank statement.
 
         Handles two formats:
-        1. Account Statement: YYYY/MM/DD | Description | Reference | Amount | Balance
-        2. Transaction History: Transaction Date | Effective Date | Description | Reference | Fees | Amount | Balance
+        1. Account Statement: YYYY/MM/DD | Effective Date | Description | Amount | Balance
+           - Uses spaces as thousand separators (e.g., "7 992.27")
+           - 2 amounts: Amount and Balance
+        2. Transaction History: Transaction Date | Effective Date | Description | Fees | Amount | Balance
+           - Uses commas as thousand separators (e.g., "5,551.20")
+           - 3 amounts: Fees, Amount (with sign), and Balance
         """
         rows = []
         first_page = self._extract_first_page_text()
+        format_type = self._detect_format(first_page)
 
         for page_text in self._iterate_pages():
-            for line in page_text.split("\n"):
-                line = line.strip()
+            lines = page_text.split("\n")
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
 
                 # Skip headers and special lines
                 if not line:
+                    i += 1
                     continue
                 if "Transaction" in line and "Date" in line:
+                    i += 1
                     continue
-                if "Effective Date" in line or "Description" in line and "Reference" in line:
+                if "Effective Date" in line and "Description" in line:
+                    i += 1
                     continue
                 if "Balance Brought Forward" in line or "BROUGHT FORWARD" in line:
-                    # Try to extract balance
-                    amounts = self.AMOUNT_PATTERN.findall(line)
+                    # Extract amounts from end
+                    amounts = self._extract_amounts_from_end(line, format_type)
                     if amounts:
-                        balance = self._clean_amount(amounts[-1])
+                        balance = self._clean_amount(amounts[-1][0])
                         rows.append(create_transaction_row(
                             "", "Balance Brought Forward", 0.0, 0.0, balance
                         ))
+                    i += 1
                     continue
 
                 # Skip summary/header lines
                 if "NEDLINK" in line and "Reference" in line:
+                    i += 1
                     continue
                 if "Fees" in line and "Amount" in line and "Balance" in line:
+                    i += 1
+                    continue
+                if "NETCASH" in line:
+                    i += 1
+                    continue
+                
+                # Skip orphan lines (TYMEBANK numbers, etc.)
+                if re.match(r'^\d+$', line):
+                    i += 1
                     continue
 
                 # Match date at start of line
                 date_match = self.DATE_PATTERN.match(line)
                 if not date_match:
+                    i += 1
                     continue
 
                 date_str = parse_date_yyyy_mm_dd(date_match.group(1))
@@ -121,76 +165,59 @@ class BidvestParser(BaseBankParser):
                 if second_date_match:
                     rest_of_line = rest_of_line[second_date_match.end():].strip()
 
-                # Find all amounts
-                amounts = self.AMOUNT_PATTERN.findall(rest_of_line)
-                if len(amounts) < 1:
+                # Extract amounts from the end of the line
+                amounts = self._extract_amounts_from_end(rest_of_line, format_type)
+                
+                if len(amounts) < 2:
+                    i += 1
                     continue
-
-                # Clean amounts and track if negative
-                cleaned_amounts = []
-                is_negative = []
-                for amt in amounts:
-                    val = self._clean_amount(amt)
-                    cleaned_amounts.append(abs(val))
-                    is_negative.append(val < 0 or "-" in amt)
-
-                # Extract description (text before first amount)
-                first_amt_match = self.AMOUNT_PATTERN.search(rest_of_line)
-                if first_amt_match:
-                    description = rest_of_line[:first_amt_match.start()].strip()
-                else:
-                    description = rest_of_line
-
-                # Balance is always last
-                balance = cleaned_amounts[-1] if cleaned_amounts else 0.0
-                # Handle negative balance
-                if is_negative and is_negative[-1]:
-                    balance = -balance
-
+                
+                # Get balance (last amount)
+                balance_str, _, balance_start, _ = amounts[-1]
+                balance = self._clean_amount(balance_str)
+                
                 debit = 0.0
                 credit = 0.0
-
-                # Determine debit/credit based on number of amounts
-                if len(cleaned_amounts) >= 3:
-                    # Format: Fees, Amount, Balance
-                    fees = cleaned_amounts[-3]
-                    amount = cleaned_amounts[-2]
-
-                    if is_negative[-2]:
-                        debit = amount
-                    else:
-                        credit = amount
-
-                    if fees > 0:
-                        debit += fees
-
-                elif len(cleaned_amounts) == 2:
-                    # Format: Amount, Balance
-                    amount = cleaned_amounts[0]
-
-                    if is_negative[0]:
-                        debit = amount
-                    else:
-                        # Determine from balance change
-                        if rows:
-                            prev_balance = rows[-1]["Balance"]
-                            diff = balance - prev_balance
-                            if diff < 0:
-                                debit = amount
-                            else:
-                                credit = amount
+                
+                if format_type == "transaction_history":
+                    # Transaction History format: Fees, Amount, Balance
+                    if len(amounts) >= 3:
+                        fees_str, _, fees_start, fees_end = amounts[-3]
+                        trans_str, trans_is_negative, trans_start, trans_end = amounts[-2]
+                        
+                        fees = self._clean_amount(fees_str)
+                        trans_amount = self._clean_amount(trans_str)
+                        
+                        # Get description (everything before fees)
+                        description = rest_of_line[:fees_start].strip()
+                        
+                        if trans_is_negative or trans_amount < 0:
+                            debit = abs(trans_amount) + fees
                         else:
-                            credit = amount
-
-                elif len(cleaned_amounts) == 1 and rows:
-                    # Only balance - calculate from balance change
-                    prev_balance = rows[-1]["Balance"]
-                    diff = balance - prev_balance
-                    if diff < 0:
-                        debit = abs(diff)
+                            credit = trans_amount
+                            if fees > 0:
+                                debit = fees
                     else:
-                        credit = diff
-
+                        i += 1
+                        continue
+                else:
+                    # Account Statement format: Amount, Balance
+                    trans_str, trans_is_negative, trans_start, trans_end = amounts[-2]
+                    trans_amount = self._clean_amount(trans_str)
+                    
+                    # Get description (everything before transaction amount)
+                    description = rest_of_line[:trans_start].strip()
+                    
+                    if trans_is_negative:
+                        debit = abs(trans_amount)
+                    else:
+                        credit = trans_amount
+                
+                # Clean up description
+                if description.endswith('-'):
+                    description = description[:-1].strip()
+                
                 rows.append(create_transaction_row(date_str, description, debit, credit, balance))
+                i += 1
 
         return pd.DataFrame(rows)

@@ -27,8 +27,10 @@ class ABSAParser(BaseBankParser):
     DATE_PATTERN_YYMMDD = re.compile(r"^\d{4,}\s+(\d{2})(\d{2})(\d{2})\s+")  # YYMMDD (Business Integrator)
     # Amount pattern for cheque statements - space as thousands separator (e.g. "11 236.59-")
     AMOUNT_PATTERN = re.compile(r"-?[\d\s,]+\.\d{2}-?")
-    # Amount pattern for Transaction History - comma as thousands separator (e.g. "-6,000.00")
-    TH_AMOUNT_PATTERN = re.compile(r"-?\d{1,3}(?:,\d{3})*\.\d{2}")
+    # Amount pattern for Transaction History - comma/space as thousands separator (e.g. "-6,000.00" or "-R4 482.32")
+    # Also handles R prefix: -R115.00, R5 300.00 (space as thousands sep)
+    # Pattern: optional minus, optional R, digits with optional comma/space thousands separators, decimal
+    TH_AMOUNT_PATTERN = re.compile(r"-?R?\s*(?:\d{1,3}(?:[,\s]\d{3})*|\d{4,})\.\d{2}")
     # Footer markers that signal end of transaction section on a page
     FOOTER_MARKERS = ["SERVICE FEE:", "MNTHLY ACCT FEE", "CHARGE: A =", "* = VAT", "INTEREST RATE"]
     # Lines to skip in Transaction History format
@@ -75,6 +77,28 @@ class ABSAParser(BaseBankParser):
             if acc_match:
                 account_number = acc_match.group(1)
 
+        # Transaction History format: account number on separate line after PO BOX
+        # Format: "PO BOX 1088 4064712281" or "NELSPRUIT 4064712281"
+        if not account_number:
+            # Look for 10-digit number following PO BOX line or on its own line
+            th_match = re.search(
+                r"PO\s+BOX\s+\d+\s+(\d{10})",
+                first_page,
+                re.IGNORECASE,
+            )
+            if th_match:
+                account_number = th_match.group(1)
+
+        # Transaction History alternative: account number after branch/city
+        if not account_number:
+            th_match2 = re.search(
+                r"(?:SQUARE BRANCH|BRANCH)\s*\n?\s*(\d{10})\s*\n",
+                first_page,
+                re.IGNORECASE,
+            )
+            if th_match2:
+                account_number = th_match2.group(1)
+
         # Get account type
         if "bizstart" in first_page.lower():
             account_type = "BizStart"
@@ -82,6 +106,8 @@ class ABSAParser(BaseBankParser):
             account_type = "Cheque Account"
         elif "savings account" in first_page.lower():
             account_type = "Savings Account"
+        elif "transaction history" in first_page.lower():
+            account_type = "Current Account"
 
         type_match = re.search(
             r"Account\s*Type[:\s]*([A-Za-z\s]+?)(?:\s{2,}|Issued|Statement|\n)",
@@ -103,15 +129,17 @@ class ABSAParser(BaseBankParser):
 
     def _detect_format(self, text: str) -> str:
         """Detect which ABSA format is being used."""
-        # Business Integrator format uses YYMMDD dates (e.g., 250901) with entry numbers
-        if re.search(r"^\d{4}\s+\d{6}\s+", text, re.MULTILINE):
-            return "business_integrator"
-        # Transaction History format uses YYYY-MM-DD dates
-        if re.search(r"\d{4}-\d{2}-\d{2}", text):
+        # Transaction History format uses YYYY-MM-DD dates - check first as it's more specific
+        if re.search(r"\d{4}-\d{2}-\d{2}", text) and "Transaction History" in text:
             return "transaction_history"
-        # Cheque account statement format
+        # Cheque account statement format - explicit header check
         if "Cheque account statement" in text:
             return "cheque_statement"
+        # Business Integrator format uses YYMMDD dates (e.g., 250901) with entry numbers
+        # Pattern: entry number (4+ digits) + space + YYMMDD date + space
+        # Must also contain "BIO CASE" to avoid false positives
+        if re.search(r"^\d{4}\s+\d{6}\s+", text, re.MULTILINE) and "BIO CASE" in text:
+            return "business_integrator"
         # BizStart format uses "D Mon YYYY" dates and comma-decimal amounts
         if re.search(
             r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}",
@@ -178,24 +206,36 @@ class ABSAParser(BaseBankParser):
                         first_match = self.TH_AMOUNT_PATTERN.search(rest_cleaned)
                         description = rest_cleaned[:first_match.start()].strip() if first_match else rest_cleaned
                         description = inline_charge.sub("", description).strip()
+                        # Clean trailing R-prefixed fragments
+                        description = re.sub(r'\s*-?R\d+\s*$', '', description).strip()
                         rows.append(create_transaction_row(date_str, description, 0.0, 0.0, balance))
                     continue
 
+                # Get raw amount strings to preserve sign information
                 # Last amount is balance, second-to-last is transaction amount
-                amount_val = normalize_amount_string(amounts[-2])
-                balance = normalize_amount_string(amounts[-1])
+                amount_raw = amounts[-2]
+                balance_raw = amounts[-1]
+
+                amount_val = normalize_amount_string(amount_raw)
+                balance = normalize_amount_string(balance_raw)
 
                 # Extract description (text before first amount in cleaned line)
                 first_match = self.TH_AMOUNT_PATTERN.search(rest_cleaned)
                 description = rest_cleaned[:first_match.start()].strip() if first_match else rest_cleaned
                 # Also clean any inline charge remnants from description
                 description = inline_charge.sub("", description).strip()
+                # Clean trailing R-prefixed fragments that look like partial amounts (e.g., "-R4", "R5")
+                description = re.sub(r'\s*-?R\d+\s*$', '', description).strip()
 
+                # Determine debit/credit from the raw amount string
+                # In ABSA Transaction History: negative amounts are debits, positive are credits
                 debit = 0.0
                 credit = 0.0
-                if amount_val < 0:
+                if amount_raw.strip().startswith("-"):
+                    # Negative amount = debit (money out)
                     debit = abs(amount_val)
-                elif amount_val > 0:
+                else:
+                    # Positive amount = credit (money in)
                     credit = amount_val
 
                 rows.append(create_transaction_row(date_str, description, debit, credit, balance))
@@ -242,8 +282,22 @@ class ABSAParser(BaseBankParser):
                 date_match = self.DATE_PATTERN_DMY.match(line)
                 if not date_match:
                     # Continuation line: append reference info to previous transaction
+                    # Only if it looks like a continuation (not a header/footer)
                     if rows and not line.startswith("(") and not line.startswith("Page "):
-                        rows[-1]["Description"] += " " + line
+                        # Skip lines that are clearly headers/footers/metadata
+                        skip_prefixes = (
+                            "eStamp", "General Enquiries", "Return address", "Private Bag",
+                            "Cheque Account Number", "Account Type", "Statement no",
+                            "Client VAT", "Our Privacy Notice", "Authorised Financial",
+                            "Registration Number", "Tax Invoice", "Absa Bank Limited",
+                            "Your transactions", "CSP", "NCWORKS", "Dep No", "Contact:",
+                            "Absa Bank Transfer", "Card No.", "Effective", "Telkom",
+                            "Tracker", "Superspar", "Arrie Nel", "Mugg And Bean",
+                            "Walk Of", "Nelspruit", "PO BOX", "1200", "013753", "008140",
+                            "008568", "0085", "08600"
+                        )
+                        if not any(line.startswith(prefix) for prefix in skip_prefixes):
+                            rows[-1]["Description"] += " " + line
                     continue
                 date_str = date_match.group(1)
                 parts = date_str.split("/")
