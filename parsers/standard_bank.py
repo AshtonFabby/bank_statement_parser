@@ -13,7 +13,7 @@ class StandardBankParser(BaseBankParser):
 
     BANK_NAME = "Standard Bank"
     BANK_ID = "standard_bank"
-    DETECTION_KEYWORDS = ["standard bank", "standardbank"]
+    DETECTION_KEYWORDS = ["standard bank", "standardbank", "standard bank of south africa"]
 
     # Date format: "17 Nov 22" (DD MMM YY) or "17 Jul 25"
     DATE_PATTERN = re.compile(
