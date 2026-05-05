@@ -30,7 +30,11 @@ class BaseBankParser(ABC):
     # Subclasses must define these
     BANK_NAME: str = ""
     BANK_ID: str = ""
-    DETECTION_KEYWORDS: list[str] = []
+    # Each keyword can be a string (weight 1) or a (keyword, weight) tuple.
+    # Higher weights make a keyword more impactful for bank detection, which
+    # helps distinguish a bank's own branding from transaction references to
+    # other banks (e.g. "CAPITEC" appearing in a Nedbank statement).
+    DETECTION_KEYWORDS: list[str | tuple[str, int]] = []
 
     def __init__(self, pdf_file: io.BytesIO):
         self.pdf_file = pdf_file
@@ -87,15 +91,19 @@ class BaseBankParser(ABC):
     def can_parse(cls, text: str) -> bool:
         """Check if this parser can handle the given PDF text."""
         text_lower = text.lower()
-        return any(keyword in text_lower for keyword in cls.DETECTION_KEYWORDS)
+        for keyword in cls.DETECTION_KEYWORDS:
+            kw = keyword[0] if isinstance(keyword, tuple) else keyword
+            if kw.lower() in text_lower:
+                return True
+        return False
 
     @classmethod
     def detection_score(cls, text: str) -> int:
         """Score how confident we are this parser matches the given text.
 
-        Uses keyword frequency to distinguish between a bank's own statement
-        (where its name appears many times in headers, footers, branding) vs
-        a mere transaction reference to another bank.
+        Uses keyword frequency * weight to distinguish between a bank's own
+        statement (where its name appears many times in headers, footers,
+        branding) vs a mere transaction reference to another bank.
 
         Returns:
             Integer score (0 = no match, higher = more confident)
@@ -103,7 +111,11 @@ class BaseBankParser(ABC):
         text_lower = text.lower()
         score = 0
         for keyword in cls.DETECTION_KEYWORDS:
-            score += text_lower.count(keyword)
+            if isinstance(keyword, tuple):
+                kw, weight = keyword
+            else:
+                kw, weight = keyword, 1
+            score += text_lower.count(kw.lower()) * weight
         return score
 
     @abstractmethod

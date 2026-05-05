@@ -31,7 +31,7 @@ class FNBParser(BaseBankParser):
 
     BANK_NAME = "FNB"
     BANK_ID = "fnb"
-    DETECTION_KEYWORDS = ["fnb", "first national bank", "fnb.co.za"]
+    DETECTION_KEYWORDS = [("fnb", 2), ("first national bank", 5), ("fnb.co.za", 10)]
 
     # Transaction History format: DD MMM YYYY (e.g., "08 Jan 2026")
     # Supports both English and Afrikaans month names (full and short forms)

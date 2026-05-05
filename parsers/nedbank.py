@@ -13,7 +13,16 @@ class NedbankParser(BaseBankParser):
 
     BANK_NAME = "Nedbank"
     BANK_ID = "nedbank"
-    DETECTION_KEYWORDS = ["nedbank", "statement enquiry", "nedbank.co.za", "transaction listing", "enc *", "profile number"]
+    DETECTION_KEYWORDS = [
+        ("nedbank", 2),
+        ("statement enquiry", 10),
+        ("nedbank.co.za", 10),
+        ("transaction listing", 10),
+        ("new online banking", 5),
+        ("account description", 5),
+        ("enc *", 3),
+        ("profile number", 3),
+    ]
 
     # Date patterns
     DATE_PATTERN = re.compile(r"(\d{2}/\d{2}/\d{4})")
@@ -335,9 +344,14 @@ class NedbankParser(BaseBankParser):
 
             # Get description
             rest_of_line = line[rest_start:].strip()
-            first_amt_pattern = self.AMOUNT_PATTERN_SPACES if format_type == "enquiry" else self.AMOUNT_PATTERN
-            first_amount_match = first_amt_pattern.search(rest_of_line)
-            if not first_amount_match:
+            if format_type == "enquiry":
+                # Use the earliest match from either space or comma pattern
+                # to avoid including small amounts (e.g. "-935.17") in descriptions
+                space_match = self.AMOUNT_PATTERN_SPACES.search(rest_of_line)
+                comma_match = self.AMOUNT_PATTERN.search(rest_of_line)
+                matches = [m for m in (space_match, comma_match) if m]
+                first_amount_match = min(matches, key=lambda m: m.start()) if matches else None
+            else:
                 first_amount_match = self.AMOUNT_PATTERN.search(rest_of_line)
             if first_amount_match:
                 description = rest_of_line[:first_amount_match.start()].strip()

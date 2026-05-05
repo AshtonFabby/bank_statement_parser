@@ -13,7 +13,11 @@ class StandardBankParser(BaseBankParser):
 
     BANK_NAME = "Standard Bank"
     BANK_ID = "standard_bank"
-    DETECTION_KEYWORDS = ["standard bank", "standardbank", "standard bank of south africa"]
+    DETECTION_KEYWORDS = [
+        ("standard bank", 2),
+        ("standardbank", 3),
+        ("standard bank of south africa", 10),
+    ]
 
     # Date format: "17 Nov 22" (DD MMM YY) or "17 Jul 25"
     DATE_PATTERN = re.compile(
@@ -486,10 +490,19 @@ class StandardBankParser(BaseBankParser):
                     continue
                 if "Page" in line and "Details" in line and "Balance" in line:
                     continue
+                if re.match(r"^\*\*\s*END OF REPORT\s*\*\*$", line, re.IGNORECASE):
+                    continue
+                if re.match(r"^DATE\s+\d{8}", line):
+                    continue
 
                 # Transaction lines start with a page number (digit(s) then space)
                 page_num_match = re.match(r"^(\d+)\s+", line)
                 if not page_num_match:
+                    # Skip footer lines that appear as non-transaction lines
+                    if re.search(r"\*\*\s*END OF REPORT\s*\*\*", line, re.IGNORECASE):
+                        continue
+                    if re.match(r"^DATE\s+\d{8}", line):
+                        continue
                     # Reference/narration line - append to last transaction description
                     if rows and line:
                         rows[-1]["Description"] = (rows[-1]["Description"] + " " + line).strip()
@@ -520,11 +533,8 @@ class StandardBankParser(BaseBankParser):
                 first_amt_match = self.AMOUNT_PATTERN.search(body)
                 description = body[:first_amt_match.start()].strip()
 
-                # Handle BALANCE BROUGHT FORWARD
+                # Handle BALANCE BROUGHT FORWARD - skip it as it duplicates opening balance
                 if "BALANCE BROUGHT FORWARD" in description.upper():
-                    rows.append(create_transaction_row(
-                        date_str, "Balance Brought Forward", 0.0, 0.0, balance
-                    ))
                     continue
 
                 # Column layout: Service Fee | Debit | Credit | (date) | Balance

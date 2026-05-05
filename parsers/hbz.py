@@ -13,7 +13,7 @@ class HBZParser(BaseBankParser):
 
     BANK_NAME = "HBZ Bank"
     BANK_ID = "hbz_bank"
-    DETECTION_KEYWORDS = ["hbz bank"]
+    DETECTION_KEYWORDS = [("hbz bank", 10)]
 
     # Date format: "Jan 02, 2024" (MMM DD, YYYY)
     DATE_PATTERN = re.compile(

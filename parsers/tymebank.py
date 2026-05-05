@@ -13,7 +13,7 @@ class TymeBankParser(BaseBankParser):
 
     BANK_NAME = "TymeBank"
     BANK_ID = "tymebank"
-    DETECTION_KEYWORDS = ["tymebank", "tyme bank"]
+    DETECTION_KEYWORDS = [("tymebank", 5), ("tyme bank", 5)]
 
     DATE_PATTERN = re.compile(
         r"^(\d{2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})",

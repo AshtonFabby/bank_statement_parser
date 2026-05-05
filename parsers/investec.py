@@ -13,7 +13,7 @@ class InvestecParser(BaseBankParser):
 
     BANK_NAME = "Investec"
     BANK_ID = "investec"
-    DETECTION_KEYWORDS = ["investec"]
+    DETECTION_KEYWORDS = [("investec", 5)]
 
     # Date pattern: DD MMM YYYY (e.g., "1 May 2025", "30 Apr 2025")
     DATE_PATTERN = re.compile(

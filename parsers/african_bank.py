@@ -13,7 +13,7 @@ class AfricanBankParser(BaseBankParser):
 
     BANK_NAME = "African Bank"
     BANK_ID = "african_bank"
-    DETECTION_KEYWORDS = ["african bank", "africanbank"]
+    DETECTION_KEYWORDS = [("african bank", 5), ("africanbank", 5)]
 
     # Date format: YYYY/MM/DD
     DATE_PATTERN = re.compile(r"^(\d{4}/\d{2}/\d{2})")

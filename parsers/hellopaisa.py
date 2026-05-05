@@ -13,7 +13,7 @@ class HelloPaisaParser(BaseBankParser):
 
     BANK_NAME = "HelloPaisa"
     BANK_ID = "hellopaisa"
-    DETECTION_KEYWORDS = ["hellopaisa", "hello paisa"]
+    DETECTION_KEYWORDS = [("hellopaisa", 10), ("hello paisa", 10)]
 
     # Date format is YYYYMMDD (e.g., 20250801)
     DATE_PATTERN = re.compile(r"^(\d{8})\s+(\d{8})\s+")

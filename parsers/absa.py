@@ -14,11 +14,11 @@ class ABSAParser(BaseBankParser):
     BANK_NAME = "ABSA"
     BANK_ID = "absa"
     DETECTION_KEYWORDS = [
-        "absa",
-        "cheque account statement",
-        "transaction history",
-        "business bank esp",
-        "bio case",
+        ("absa", 1),
+        ("cheque account statement", 10),
+        ("transaction history", 3),
+        ("business bank esp", 10),
+        ("bio case", 10),
     ]
 
     # Date patterns - ABSA uses multiple formats

@@ -14,10 +14,10 @@ class BidvestParser(BaseBankParser):
     BANK_NAME = "Bidvest Bank"
     BANK_ID = "bidvest"
     DETECTION_KEYWORDS = [
-        "bidvest",
-        "branch code:462005",
-        "craft hardware",
-        "vilbes investments",
+        ("bidvest", 5),
+        ("branch code:462005", 10),
+        ("craft hardware", 5),
+        ("vilbes investments", 5),
     ]
 
     # Date pattern YYYY/MM/DD

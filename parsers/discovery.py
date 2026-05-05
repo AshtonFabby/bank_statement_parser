@@ -13,7 +13,7 @@ class DiscoveryParser(BaseBankParser):
 
     BANK_NAME = "Discovery Bank"
     BANK_ID = "discovery_bank"
-    DETECTION_KEYWORDS = ["discovery"]
+    DETECTION_KEYWORDS = [("discovery", 3)]
 
     # Transaction History format: YYYY-MM-DD
     DATE_PATTERN_YYYY_MM_DD = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\b")
