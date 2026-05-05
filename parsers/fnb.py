@@ -31,7 +31,7 @@ class FNBParser(BaseBankParser):
 
     BANK_NAME = "FNB"
     BANK_ID = "fnb"
-    DETECTION_KEYWORDS = ["fnb", "first national bank"]
+    DETECTION_KEYWORDS = ["fnb", "first national bank", "fnb.co.za"]
 
     # Transaction History format: DD MMM YYYY (e.g., "08 Jan 2026")
     # Supports both English and Afrikaans month names (full and short forms)
@@ -102,7 +102,7 @@ class FNBParser(BaseBankParser):
                 if account_match:
                     raw_type = account_match.group(1).strip()
                     # Clean up - remove common prefixes (English and Afrikaans)
-                    clean_type = re.sub(r'^(?:Customer VAT Registration Number Not Provided\s+|Nie\s+Verskaf\s+|\d+\s+)', '', raw_type, flags=re.IGNORECASE).strip()
+                    clean_type = re.sub(r'^(?:Customer VAT Registration Number\s+\S+\s+|Nie\s+Verskaf\s+|\d+\s+)', '', raw_type, flags=re.IGNORECASE).strip()
                     account_type = clean_type
                     account_number = account_match.group(2).strip()
                     break
