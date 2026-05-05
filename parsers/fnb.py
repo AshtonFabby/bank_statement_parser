@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # Optional OCR support – gracefully degrade when tesseract is not installed.
 try:
     import pytesseract
-    from PIL import Image
+    from PIL import Image as _  # noqa: F401
 
     _OCR_AVAILABLE = True
 except ImportError:
@@ -330,12 +330,293 @@ class FNBParser(BaseBankParser):
                 return round(w["top"], 1)
         return None
 
+    # ── Positional parsing helpers for Bank Statement format ────────────
+
+    @staticmethod
+    def _detect_fnb_columns(page) -> dict | None:
+        """Detect FNB column positions from header words on a page.
+
+        Finds the header row where Date, Description, Amount, and Balance all
+        appear on (approximately) the same y-position. Returns a dict with
+        column boundary x-positions, or None if headers are not found.
+        """
+        words = page.extract_words()
+        if not words:
+            return None
+
+        y_tolerance = 15.0
+        header_keywords = {"date", "description", "amount", "balance"}
+        optional_keywords = {"charges", "bank", "accrued"}
+
+        # Group potential header words by y-position (buckets of y_tolerance)
+        from collections import defaultdict
+        y_buckets: dict[int, list] = defaultdict(list)
+        for w in words:
+            text_lower = w["text"].lower().strip()
+            key = text_lower if text_lower in (header_keywords | optional_keywords) else None
+            if key:
+                bucket = int(w["top"] // y_tolerance)
+                y_buckets[bucket].append((key, w["x0"], w["top"]))
+
+        best_count = 0
+        best_cols = {}
+        for bucket, entries in y_buckets.items():
+            found = {}
+            for key, x0, y in entries:
+                if key not in found:
+                    found[key] = x0
+            required_found = sum(1 for k in header_keywords if k in found)
+            if required_found > best_count:
+                best_count = required_found
+                best_cols = found
+
+        if best_count < 3 or "amount" not in best_cols or "balance" not in best_cols:
+            return None
+
+        amount_x = best_cols["amount"]
+        balance_x = best_cols["balance"]
+        charges_x = best_cols.get("charges", best_cols.get("bank", balance_x + 50))
+
+        midpoint_ab = (amount_x + balance_x) / 2
+        midpoint_bc = (balance_x + charges_x) / 2 if charges_x != balance_x + 50 else balance_x + 25
+
+        return {
+            "date_end": 35,
+            "amount_start": amount_x - 15,
+            "amount_end": midpoint_ab,
+            "balance_start": midpoint_ab,
+            "balance_end": midpoint_bc,
+            "charges_start": charges_x - 5,
+        }
+
+    @staticmethod
+    def _group_words_into_rows(page, y_tolerance: float = 4.0) -> list[tuple[float, list]]:
+        """Group page words into visual rows by y-position.
+
+        Returns a list of (y_mean, [words]) tuples sorted by y-position.
+        """
+        words = page.extract_words()
+        if not words:
+            return []
+
+        words_sorted = sorted(words, key=lambda w: (w["top"], w["x0"]))
+        rows: list[tuple[float, list]] = []
+        current_row: list = []
+        current_y = None
+
+        for w in words_sorted:
+            y = w["top"]
+            if current_y is None or abs(y - current_y) <= y_tolerance:
+                current_row.append(w)
+                if current_y is None:
+                    current_y = y
+            else:
+                if current_row:
+                    y_mean = sum(ww["top"] for ww in current_row) / len(current_row)
+                    rows.append((y_mean, current_row))
+                current_row = [w]
+                current_y = y
+
+        if current_row:
+            y_mean = sum(ww["top"] for ww in current_row) / len(current_row)
+            rows.append((y_mean, current_row))
+
+        return rows
+
+    _AMOUNT_RE = re.compile(r"^([\d,]+\.\d{2})(Cr|Kt)?$", re.IGNORECASE)
+
+    def _parse_amount_word(self, text: str) -> tuple[float, bool] | None:
+        """Parse a word as an amount with optional Cr/Kt suffix.
+
+        Returns (value, has_cr_suffix) or None if not an amount.
+        """
+        text = text.strip()
+        m = self._AMOUNT_RE.match(text)
+        if not m:
+            return None
+        amount_str = m.group(1)
+        has_cr = bool(m.group(2))
+        val = self._clean_amount(amount_str)
+        return val, has_cr
+
+    def _extract_bank_statement_page_positional(
+        self,
+        page,
+        page_text: str,
+        columns: dict,
+        previous_balance: float | None,
+        current_year: str | None,
+        start_month,
+        start_year,
+        end_month,
+        end_year,
+    ) -> tuple[list, float | None]:
+        """Parse a Bank Statement format page using word position data.
+
+        Uses column boundaries to correctly distinguish amounts in the
+        transaction Amount column from numbers in the Description column,
+        and bank charges in the Accrued Bank Charges column.
+
+        Returns (list_of_rows, previous_balance).
+        """
+        rows = []
+        date_end = columns["date_end"]
+        amount_start = columns["amount_start"]
+        balance_start = columns["balance_start"]
+        balance_end = columns["balance_end"]
+        charges_start = columns["charges_start"]
+
+        word_rows = self._group_words_into_rows(page)
+
+        if start_year is None:
+            s_mo, s_yr, e_mo, e_yr = self._extract_statement_period(page_text)
+            if s_yr is not None:
+                start_month, start_year, end_month, end_year = s_mo, s_yr, e_mo, e_yr
+
+        for _y_pos, row_words in word_rows:
+            date_words = []
+            desc_words = []
+            amount_words = []
+            balance_words = []
+            charge_words = []
+
+            for w in row_words:
+                x0 = w["x0"]
+                text = w["text"].strip()
+                if not text:
+                    continue
+                if x0 < date_end:
+                    date_words.append(w)
+                elif x0 < amount_start:
+                    desc_words.append(w)
+                elif x0 < balance_start:
+                    amount_words.append(w)
+                elif x0 < balance_end:
+                    balance_words.append(w)
+                elif x0 >= charges_start:
+                    charge_words.append(w)
+                else:
+                    pass
+
+            # ── Handle Opening / Closing Balance ────────────────────────
+            all_text = " ".join(w["text"].strip() for w in row_words)
+            all_lower = all_text.lower()
+            if "opening balance" in all_lower or "statement balance" in all_lower or "openingsaldo" in all_lower:
+                for bw in balance_words:
+                    parsed = self._parse_amount_word(bw["text"])
+                    if parsed:
+                        val, has_cr = parsed
+                        balance = val if has_cr else -val
+                        rows.append(create_transaction_row("", "Opening Balance", 0.0, 0.0, balance))
+                        previous_balance = balance
+                        break
+                continue
+            if "closing balance" in all_lower or "sluitsaldo" in all_lower:
+                for bw in balance_words:
+                    parsed = self._parse_amount_word(bw["text"])
+                    if parsed:
+                        val, has_cr = parsed
+                        balance = val if has_cr else -val
+                        previous_balance = balance
+                        break
+                continue
+
+            # ── Skip header / footer / non-transaction rows ─────────────
+            if not date_words:
+                continue
+            date_text = " ".join(w["text"].strip() for w in date_words)
+            dm = self.DATE_PATTERN_NO_YEAR.match(date_text)
+            if not dm:
+                dm = self.DATE_PATTERN_WITH_YEAR.match(date_text)
+            if not dm:
+                continue
+
+            has_year = bool(dm.lastindex and dm.lastindex >= 3 and dm.group(3))
+            day = dm.group(1)
+            month_abbr = dm.group(2).lower()
+            month = MONTH_MAP.get(month_abbr, "01")
+            if has_year:
+                year = dm.group(3)
+            else:
+                month_num = int(month)
+                year = self._assign_year(
+                    month_num, start_month, start_year, end_month, end_year, current_year,
+                )
+            date_str = f"{day}/{month}/{year}"
+
+            # ── Build description ───────────────────────────────────────
+            description = " ".join(w["text"].strip() for w in desc_words).strip() or None
+
+            # ── Parse amount(s) in the Amount column ───────────────────
+            # There should be exactly 1 amount word. If the word has a Cr/Kt
+            # suffix it is a credit; otherwise it is a debit.
+            tx_debit = 0.0
+            tx_credit = 0.0
+            tx_amount_val = 0.0
+            tx_amount_has_cr = False
+
+            if amount_words:
+                amt_text = amount_words[-1]["text"].strip()
+                parsed = self._parse_amount_word(amt_text)
+                if parsed:
+                    tx_amount_val, tx_amount_has_cr = parsed
+                    if tx_amount_has_cr:
+                        tx_credit = tx_amount_val
+                        tx_debit = 0.0
+                    else:
+                        tx_debit = tx_amount_val
+                        tx_credit = 0.0
+
+            # ── Parse balance in the Balance column ──────────────────────
+            balance = None
+            balance_has_cr = False
+            for bw in balance_words:
+                parsed = self._parse_amount_word(bw["text"])
+                if parsed:
+                    balance, balance_has_cr = parsed
+                    break
+
+            # If no balance found but we have an amount, try to infer from
+            # the amount using previous_balance
+            if balance is None:
+                if previous_balance is not None and (tx_debit or tx_credit):
+                    balance = previous_balance - tx_debit + tx_credit
+                else:
+                    continue
+
+            # Convert debit-balance convention:
+            # No Cr/Kt suffix → debit balance (negative in our convention)
+            if not balance_has_cr:
+                balance = -abs(balance)
+
+            # ── Fallback: if amount missing but we have description ────
+            # (e.g. bank-charge-only lines with no Amount column value)
+            if tx_debit == 0.0 and tx_credit == 0.0 and description is None:
+                # Skip rows with no amount and no description
+                continue
+
+            # ── OCR for missing descriptions ────────────────────────────
+            if not description:
+                line_top = row_words[0]["top"] if row_words else None
+                if line_top is not None:
+                    ocr_desc = self._ocr_image_description(page, line_top)
+                    if ocr_desc:
+                        description = ocr_desc
+
+            if not description:
+                description = "Unspecified"
+
+            rows.append(create_transaction_row(date_str, description, tx_debit, tx_credit, balance))
+            previous_balance = balance
+
+        return rows, previous_balance
+
     def extract_transactions(self) -> pd.DataFrame:
         """Extract transactions from FNB statement.
 
         Handles three formats:
         1. Transaction History (CR/DR): DD MMM YYYY with CR/DR amounts
-        2. Bank Statement: DD MMM with plain amounts
+        2. Bank Statement: DD MMM with plain amounts (positional parsing)
         3. Transaction History (ISO): YYYY-MM-DD with ZAR amounts
         """
         rows = []
@@ -344,6 +625,8 @@ class FNBParser(BaseBankParser):
         start_month = start_year = end_month = end_year = None
         iso_mode = False
         iso_desc_fragments: list[str] = []
+        bank_stmt_positional = False
+        cached_columns = None
 
         for page_text, page in self._iterate_pages_with_objects():
             # Detect ISO Transaction History format early
@@ -362,7 +645,24 @@ class FNBParser(BaseBankParser):
                 if s_yr is not None:
                     start_month, start_year, end_month, end_year = s_mo, s_yr, e_mo, e_yr
 
-            # Pre-extract words once per page (used by _find_line_top)
+            # Detect Bank Statement format columns for positional parsing
+            if not iso_mode and not bank_stmt_positional:
+                cols = self._detect_fnb_columns(page)
+                if cols is not None:
+                    bank_stmt_positional = True
+                    cached_columns = cols
+
+            # ── Positional parsing for Bank Statement format ──────────
+            if bank_stmt_positional and not iso_mode:
+                page_rows, previous_balance = self._extract_bank_statement_page_positional(
+                    page, page_text, cached_columns,
+                    previous_balance, current_year,
+                    start_month, start_year, end_month, end_year,
+                )
+                rows.extend(page_rows)
+                continue
+
+            # ── Fallback: text-based line parsing (CR/DR & ISO) ─────────
             page_words = page.extract_words()
 
             for line in page_text.split("\n"):
@@ -386,12 +686,8 @@ class FNBParser(BaseBankParser):
                     amounts = self.AMOUNT_PATTERN_PLAIN.findall(line)
                     if amounts:
                         balance = self._clean_amount(amounts[0])
-                        # Check for Dr/Cr/Dt/Kt suffix right after the first amount.
-                        # FNB format: "Opening Balance 2,843.13Dr" or "... 5,000.00Cr"
-                        # Afrikaans: "Openingsaldo 373,625.17Dt" or "... 384,020.98Kt"
                         after_amount = line[line.find(amounts[0]) + len(amounts[0]):].lstrip()
                         after_lower = after_amount.lower()
-                        # Cr/Kt = credit balance (positive), Dr/Dt = debit balance (negative)
                         is_cr_balance = after_lower.startswith("cr") or after_lower.startswith("kt")
                         if not is_cr_balance:
                             balance = -balance
@@ -414,8 +710,7 @@ class FNBParser(BaseBankParser):
                         previous_balance = row["Balance"]
                     continue
 
-                # Collect description fragments for ISO mode (non-date lines
-                # that precede a date line belong to the next transaction)
+                # Collect description fragments for ISO mode
                 if iso_mode and not self.DATE_PATTERN_WITH_YEAR.match(line) \
                         and not self.DATE_PATTERN_NO_YEAR.match(line):
                     iso_desc_fragments.append(line)
@@ -426,14 +721,12 @@ class FNBParser(BaseBankParser):
                 has_year = True
 
                 if not date_match:
-                    # Try matching without year (Bank Statement format)
                     date_match = self.DATE_PATTERN_NO_YEAR.match(line)
                     has_year = False
 
                 if not date_match:
                     continue
 
-                # Parse date
                 day = date_match.group(1)
                 month_abbr = date_match.group(2).lower()
                 month = MONTH_MAP.get(month_abbr, "01")
@@ -450,36 +743,21 @@ class FNBParser(BaseBankParser):
                     )
 
                 date_str = f"{day}/{month}/{year}"
-
-                # Get the rest of the line after the date
                 rest_of_line = line[date_match.end():].strip()
 
-                # Determine format:
-                # - Transaction History: BOTH the amount AND balance carry a
-                #   CR/DR suffix (e.g. "284.77 CR 0.00 CR") -> >=2 CR/DR tokens
-                # - Bank Statement: only credit amounts carry a 'Cr' suffix;
-                #   the running balance is a plain number -> <=1 CR/DR token
-                #   Exception: when account flips to credit both amount and
-                #   balance may have 'Cr' -> treated as Transaction History.
                 cr_dr_matches = self.AMOUNT_PATTERN_CR_DR.findall(rest_of_line)
                 has_cr_dr = len(cr_dr_matches) >= 2
 
                 if has_cr_dr:
-                    # Transaction History format with CR/DR
                     row = self._parse_transaction_history_line(rest_of_line, date_str)
                     if row:
                         rows.append(row)
                         previous_balance = row["Balance"]
                 else:
-                    # Bank Statement format with plain amounts (and optional Cr)
                     row = self._parse_bank_statement_line(rest_of_line, date_str, previous_balance)
                     if row:
-                        # If description is missing, attempt OCR on any
-                        # image rendered in the description column.
                         if not row.get("Description"):
-                            line_top = self._find_line_top(
-                                page_words, rest_of_line,
-                            )
+                            line_top = self._find_line_top(page_words, rest_of_line)
                             if line_top is not None:
                                 ocr_desc = self._ocr_image_description(page, line_top)
                                 if ocr_desc:
@@ -487,8 +765,6 @@ class FNBParser(BaseBankParser):
                         rows.append(row)
                         previous_balance = row["Balance"]
 
-        # ISO Transaction History lists rows in reverse chronological order
-        # (newest first). Reverse them so the DataFrame is chronological.
         if iso_mode and rows:
             rows.reverse()
 

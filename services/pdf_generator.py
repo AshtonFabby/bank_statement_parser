@@ -562,7 +562,7 @@ def generate_summary_pdf(
         "Business Fuel": ["Bfuel"],
         "Growise": ["ingrowis"],
         "GapAccess": ["Batchdep"],
-        "Lulalend": ["lulalend"],
+        "Lulalend": ["lulalend", "lulald", "pm8+lulal"],
         "Fundrr": ["Fundrr"],
         "Bridgement": ["Rebridgem"],
         "Cash/Capital Connect": ["cconnect"],
