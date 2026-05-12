@@ -28,5 +28,5 @@ htmlcov/
 *.swp
 
 #files
-/bank_statement
+/bank_statements
 /parsed

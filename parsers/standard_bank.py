@@ -29,12 +29,21 @@ class StandardBankParser(BaseBankParser):
         r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\b",
         re.IGNORECASE,
     )
+    # Date format for transactional history without year on date line: "22 Oct"
+    DATE_PATTERN_NO_YEAR = re.compile(
+        r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b",
+        re.IGNORECASE,
+    )
+    # Standalone year line (e.g. "2025" on its own line in transactional history)
+    YEAR_LINE_PATTERN = re.compile(r"^\d{4}$")
     # Date format for current account statements: YYYYMMDD (e.g. 20250804)
     DATE_PATTERN_8D = re.compile(r"\b(20\d{2})(\d{2})(\d{2})\b")
     # Amount pattern - handles comma-separated amounts and negative values
     AMOUNT_PATTERN = re.compile(r"-?[\d,]+\.\d{2}")
     # SA format amounts: comma decimal, space thousands (e.g. -432 785,10 or +41 635,00)
     SA_AMOUNT_PATTERN = re.compile(r"[+-]?\d{1,3}(?: \d{3})*,\d{2}")
+    # SA format amounts: period decimal, space thousands (e.g. -7 936 635.59 or + 40 440.00)
+    SA_AMOUNT_PATTERN_PERIOD = re.compile(r"[+-]?\s?\d{1,3}(?: \d{3})*\.\d{2}")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Standard Bank statement."""
@@ -71,6 +80,17 @@ class StandardBankParser(BaseBankParser):
             if acc_match:
                 account_type = acc_match.group(1).strip()
                 account_number = acc_match.group(2).strip()
+
+        # Transactional history format with dashes: "Account: Current Acc 41-059-012-6"
+        if not account_number:
+            acc_match = re.search(
+                r"Account:\s*(.+?)\s+([\d][\d\-]{8,})",
+                first_page,
+                re.IGNORECASE,
+            )
+            if acc_match:
+                account_type = acc_match.group(1).strip()
+                account_number = acc_match.group(2).strip().replace("-", "")
 
         # Business statement format: "BUSINESS CURRENT ACCOUNT Account Number 02 058 050 9"
         if not account_number:
@@ -186,16 +206,64 @@ class StandardBankParser(BaseBankParser):
         val = float(s)
         return -val if neg else val
 
+    def _parse_sa_amount_period(self, amt_str: str) -> float:
+        """Parse SA-format amount with period decimal and space thousands (e.g. + 40 440.00 or -7 936 635.59)."""
+        s = amt_str.strip()
+        neg = s.startswith("-")
+        s = s.lstrip("+-").strip()
+        s = s.replace(" ", "")
+        val = float(s)
+        return -val if neg else val
+
+    def _extract_year_from_date_range(self) -> str | None:
+        """Extract the start year from the 'Transaction date range' header."""
+        first_page = self._extract_first_page_text()
+        m = re.search(
+            r"Transaction\s+date\s+range[:\s]*\d{1,2}\s+\w+\s+(\d{4})",
+            first_page, re.IGNORECASE,
+        )
+        if m:
+            return m.group(1)
+        m = re.search(
+            r"Transaction\s+date\s+range[:\s]*.*?(\d{4})",
+            first_page, re.IGNORECASE,
+        )
+        if m:
+            return m.group(1)
+        return None
+
+    MONTH_ORDER = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+        "may": 5, "jun": 6, "jul": 7, "aug": 8,
+        "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+
     def _extract_transactions_history(self) -> pd.DataFrame:
         """Extract transactions from Standard Bank transactional history format.
 
         Format uses SA number conventions:
-        - Comma as decimal separator
-        - Space as thousands separator
+        - Comma as decimal separator, space as thousands (e.g. +41 635,00)
+        - OR period as decimal separator, space as thousands (e.g. + 40 440.00)
         - +/- prefix for credits/debits
         - Columns: In (R), Out (R), Bank fees (R), Balance (R)
+
+        Supports two date layouts:
+        1. DD MMM YYYY on each line (e.g. "09 Feb 2026")
+        2. Standalone year line (e.g. "2025") followed by DD MMM lines (e.g. "22 Oct")
         """
         rows = []
+        current_year = self._extract_year_from_date_range()
+        prev_month_num = 0
+
+        # Detect whether amounts use comma or period as decimal separator
+        # by scanning the first page for the respective patterns
+        first_page = self._extract_first_page_text()
+        if self.SA_AMOUNT_PATTERN.search(first_page):
+            amt_pattern = self.SA_AMOUNT_PATTERN
+            amt_parser = self._parse_sa_amount
+        else:
+            amt_pattern = self.SA_AMOUNT_PATTERN_PERIOD
+            amt_parser = self._parse_sa_amount_period
 
         for page_text in self._iterate_pages():
             lines = page_text.split("\n")
@@ -220,24 +288,50 @@ class StandardBankParser(BaseBankParser):
                 if "Customer Care" in line or "Website:" in line:
                     continue
 
-                # Try matching date at start of line (DD MMM YYYY)
-                date_match = self.DATE_PATTERN_4Y.match(line)
-                if not date_match:
-                    # Not a date line - save as potential description for next transaction
-                    prev_desc = line
+                # Check for standalone year line (e.g. "2025" on its own line)
+                if self.YEAR_LINE_PATTERN.match(line):
+                    current_year = line.strip()
+                    prev_month_num = 0
                     continue
 
-                day = date_match.group(1)
-                month = MONTH_MAP.get(date_match.group(2).lower(), "01")
-                year = date_match.group(3)
-                date_str = f"{day}/{month}/{year}"
+                # Try matching date at start of line (DD MMM YYYY)
+                date_match = self.DATE_PATTERN_4Y.match(line)
+                if date_match:
+                    day = date_match.group(1)
+                    month = MONTH_MAP.get(date_match.group(2).lower(), "01")
+                    year = date_match.group(3)
+                    date_str = f"{day}/{month}/{year}"
+                    current_year = year
+                    prev_month_num = self.MONTH_ORDER.get(date_match.group(2).lower(), 0)
+                else:
+                    # Try matching date without year (DD MMM)
+                    date_match = self.DATE_PATTERN_NO_YEAR.match(line)
+                    if date_match:
+                        day = date_match.group(1)
+                        month_str = date_match.group(2).lower()
+                        month = MONTH_MAP.get(month_str, "01")
+                        month_num = self.MONTH_ORDER.get(month_str, 0)
+                        if current_year:
+                            # Year rollover: Dec -> Jan means increment year
+                            if prev_month_num and month_num and month_num < prev_month_num:
+                                try:
+                                    current_year = str(int(current_year) + 1)
+                                except ValueError:
+                                    pass
+                            date_str = f"{day.zfill(2)}/{month}/{current_year}"
+                            prev_month_num = month_num
+                        else:
+                            prev_desc = line
+                            continue
+                    else:
+                        prev_desc = line
+                        continue
 
                 rest = line[date_match.end():].strip()
 
-                # Find all SA-format amounts in the line
-                amt_matches = list(self.SA_AMOUNT_PATTERN.finditer(rest))
+                # Find all amounts using the detected format
+                amt_matches = list(amt_pattern.finditer(rest))
                 if len(amt_matches) < 2:
-                    # Need at least transaction amount + balance
                     prev_desc = line
                     continue
 
@@ -249,7 +343,7 @@ class StandardBankParser(BaseBankParser):
                     description = prev_desc
 
                 # Parse all amounts
-                parsed = [self._parse_sa_amount(m.group()) for m in amt_matches]
+                parsed = [amt_parser(m.group()) for m in amt_matches]
                 balance = parsed[-1]
 
                 # Transaction amounts are all except the last (balance)
@@ -652,9 +746,11 @@ class StandardBankParser(BaseBankParser):
                     description = rest_of_line
 
                 # Parse amounts - Standard Bank has Payments, Deposits, Balance columns
+                # Use the actual signed value for balance (preserves negative for overdraft)
+                # but cleaned_amounts stores abs values for debit/credit magnitudes.
                 debit = 0.0
                 credit = 0.0
-                balance = cleaned_amounts[-1] if cleaned_amounts else 0.0
+                balance = self._clean_amount(amounts[-1]) if amounts else 0.0
 
                 # If 3 amounts: Payments, Deposits, Balance
                 if len(cleaned_amounts) == 3:
