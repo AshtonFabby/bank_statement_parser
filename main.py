@@ -212,6 +212,46 @@ def _standardize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _verify_grouped_results(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, list]:
+    """Verify and correct transactions, grouping by Source column if present.
+
+    Returns a tuple of (corrected_df, verification_results) where
+    verification_results is a list of VerificationResult objects
+    suitable for passing to generate_summary_pdf().
+    """
+    verification_results: list = []
+    corrected_dfs: list[pd.DataFrame] = []
+
+    if "Source" in df.columns and df["Source"].nunique() > 1:
+        for source_name, group in df.groupby("Source", sort=False):
+            corrected_df, vr = verify_and_correct(
+                group.reset_index(drop=True),
+                filename=str(source_name),
+                bank_name=str(source_name),
+                bank_id="",
+                account_number=None,
+            )
+            verification_results.append(vr)
+            corrected_df["Source"] = source_name
+            corrected_dfs.append(corrected_df)
+        combined = pd.concat(corrected_dfs, ignore_index=True)
+    else:
+        source = df["Source"].iloc[0] if "Source" in df.columns else "combined"
+        corrected_df, vr = verify_and_correct(
+            df.reset_index(drop=True),
+            filename=str(source),
+            bank_name=str(source),
+            bank_id="",
+            account_number=None,
+        )
+        verification_results.append(vr)
+        combined = corrected_df
+
+    return combined, verification_results
+
+
 def _deduplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
     """Remove duplicate transactions that arise when a bank statement and transaction
     history overlap in date range.  Two rows are considered duplicates when they share
@@ -511,6 +551,14 @@ async def generate_report(
         records
     )
 
+    corrected_df, verification_results = _verify_grouped_results(combined_df)
+    if corrected_df is not None:
+        combined_df = corrected_df
+        summary = calculate_summary(combined_df)
+        coverage = calculate_coverage(combined_df)
+        activity = calculate_activity_volume(combined_df)
+        revenue = calculate_revenue(combined_df)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_buffer = io.BytesIO()
 
@@ -520,7 +568,8 @@ async def generate_report(
         zip_file.writestr(f"combined_parsed_{timestamp}.xlsx", excel_buffer.getvalue())
 
         pdf_buffer = generate_summary_pdf(
-            combined_df, summary, coverage, activity, revenue
+            combined_df, summary, coverage, activity, revenue,
+            verification_results=verification_results,
         )
         zip_file.writestr(f"combined_summary_{timestamp}.pdf", pdf_buffer.getvalue())
 
@@ -595,8 +644,16 @@ async def generate_full_prevet(
             combined_df, summary, coverage, activity, revenue = (
                 _build_report_from_transactions(records)
             )
+            corrected_df, verification_results = _verify_grouped_results(combined_df)
+            if corrected_df is not None:
+                combined_df = corrected_df
+                summary = calculate_summary(combined_df)
+                coverage = calculate_coverage(combined_df)
+                activity = calculate_activity_volume(combined_df)
+                revenue = calculate_revenue(combined_df)
             bank_pdf_buffer = generate_summary_pdf(
-                combined_df, summary, coverage, activity, revenue
+                combined_df, summary, coverage, activity, revenue,
+                verification_results=verification_results,
             )
             bank_analysis_pdf_bytes = bank_pdf_buffer.getvalue()
 
@@ -616,8 +673,18 @@ async def generate_full_prevet(
 
             if results:
                 all_dfs = []
+                verification_results = []
                 for result in results:
-                    df_with_source = result["df"].copy()
+                    corrected_df, vr = verify_and_correct(
+                        result["df"],
+                        filename=result["filename"],
+                        bank_name=result["bank_name"],
+                        bank_id=result.get("bank_id", ""),
+                        account_number=result.get("account_number"),
+                    )
+                    verification_results.append(vr)
+                    result["df"] = corrected_df
+                    df_with_source = corrected_df.copy()
                     df_with_source["Source"] = result["bank_name"]
                     all_dfs.append(df_with_source)
 
@@ -636,6 +703,7 @@ async def generate_full_prevet(
                     combined_coverage,
                     combined_activity,
                     combined_revenue,
+                    verification_results=verification_results,
                 )
                 bank_analysis_pdf_bytes = bank_pdf_buffer.getvalue()
 
