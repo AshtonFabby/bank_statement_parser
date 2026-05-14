@@ -41,15 +41,16 @@ class CapitecParser(BaseBankParser):
         for i, line in enumerate(lines):
             line_lower = line.lower().strip()
 
-            # Look for "Account No." or "Account number"
-            if "account no" in line_lower or "account number" in line_lower:
-                match = re.search(r"\d{8,12}", line)
-                if match:
-                    account_number = match.group()
-                elif i + 1 < len(lines):
-                    match = re.search(r"\d{8,12}", lines[i + 1])
+            # Look for "Account No.", "Account number", or bare "Account [number]"
+            if "account type" not in line_lower and "account holder" not in line_lower:
+                if "account no" in line_lower or "account number" in line_lower or "account" in line_lower:
+                    match = re.search(r"\d{7,12}", line)
                     if match:
                         account_number = match.group()
+                    elif i + 1 < len(lines):
+                        match = re.search(r"\d{7,12}", lines[i + 1])
+                        if match:
+                            account_number = match.group()
 
             # Look for account type
             if "account type" in line_lower:
@@ -122,18 +123,27 @@ class CapitecParser(BaseBankParser):
 
         return indices
 
-    def _parse_business_format_table(self, page, rows: list) -> bool:
+    def _parse_business_format_table(self, page, rows: list, in_transactions: bool = False) -> tuple[bool, bool]:
         """Parse business account format using pdfplumber table extraction.
 
         Uses structured table extraction for bordered tables.
         Dynamically detects column layout from header row.
 
+        Skips tables that appear before Transaction History (e.g. Scheduled Payments).
+
+        Args:
+            page: pdfplumber page object.
+            rows: List to append parsed transaction rows to.
+            in_transactions: Whether we've already entered the Transaction History
+                section on a prior page or table.
+
         Returns:
-            True if table extraction succeeded and found data, False otherwise.
+            Tuple of (found_data, in_transactions). found_data is True if table
+            extraction succeeded and found data. in_transactions is the updated flag.
         """
         tables = page.extract_tables()
         if not tables:
-            return False
+            return False, in_transactions
 
         found_data = False
         for table in tables:
@@ -150,6 +160,18 @@ class CapitecParser(BaseBankParser):
             # If no header found, skip this table
             if not col_map:
                 continue
+
+            # If we haven't entered the transaction section yet, check the header
+            # for transaction-history markers. Skip non-transaction tables.
+            if not in_transactions:
+                combined_header = " ".join((c or "") for c in col_map.keys()).lower()
+                # Tables with Post Date / Trans Date are transaction tables
+                if "post_date" in col_map and "trans_date" in col_map:
+                    in_transactions = True
+                elif "trans_date" in col_map:
+                    in_transactions = True
+                else:
+                    continue
 
             # Get column indices with fallbacks
             desc_idx = col_map.get("description")
@@ -268,27 +290,31 @@ class CapitecParser(BaseBankParser):
                 )
                 found_data = True
 
-        return found_data
+        return found_data, in_transactions
 
-    def _parse_business_format(self, page_text: str, rows: list) -> None:
+    def _parse_business_format(self, page_text: str, rows: list, in_transactions: bool = False) -> bool:
         """Parse business account format from extracted text.
 
         Format: Post Date | Trans Date | Description | Reference | Fees | Amount | Balance
         - Fees column (negative values like -6.0)
         - Amount has +/- prefix for credit/debit
+
+        Skips content before the Transaction History section unless
+        in_transactions is True.
+
+        Args:
+            page_text: Extracted text from a single PDF page.
+            rows: List to append parsed transaction rows to.
+            in_transactions: Whether we've already entered the Transaction History
+                section on a prior page.
+
+        Returns:
+            Updated in_transactions flag.
         """
         for line in page_text.split("\n"):
             line = line.strip()
 
-            # Skip headers
-            if not line or ("Post" in line and "Date" in line):
-                continue
-            if "Description" in line and "Reference" in line:
-                continue
-            if "Transaction history" in line:
-                continue
-
-            # Handle "Balance brought forward" - can have different formats
+            # Always process Balance brought forward regardless of section
             if (
                 "balance brought forward" in line.lower()
                 or "balance b/forward" in line.lower()
@@ -305,8 +331,22 @@ class CapitecParser(BaseBankParser):
                     )
                 continue
 
-            # Handle "Interest Rate" line - skip
-            if "interest rate" in line.lower():
+            # Skip all content before Transaction History section
+            if not in_transactions:
+                if "transaction history" in line.lower():
+                    in_transactions = True
+                elif re.search(r"post.*date.*balance", line.lower()):
+                    in_transactions = True
+                continue
+
+            # Below: we are in the transaction section
+
+            # Skip headers
+            if not line or ("Post" in line and "Date" in line):
+                continue
+            if "Description" in line and "Reference" in line:
+                continue
+            if "Transaction history" in line:
                 continue
 
             # Check for business format: DD/MM/YY DD/MM/YY ...
@@ -396,24 +436,29 @@ class CapitecParser(BaseBankParser):
                 create_transaction_row(date_str, description, debit, credit, balance)
             )
 
-    def _parse_standard_format(self, page_text: str, rows: list) -> None:
+    def _parse_standard_format(self, page_text: str, rows: list, in_transactions: bool = False) -> bool:
         """Parse standard personal account format.
 
         Format: Date | Description | Reference | Money in | Money out | Fees | Balance
         Also handles newer format with different column structures.
+
+        Skips content before the Transaction History section (Scheduled Payments,
+        Debit Orders, Card Subscriptions, Spending Summary, etc.) unless
+        in_transactions is True.
+
+        Args:
+            page_text: Extracted text from a single PDF page.
+            rows: List to append parsed transaction rows to.
+            in_transactions: Whether we've already entered the Transaction History
+                section on a prior page.
+
+        Returns:
+            Updated in_transactions flag (True once Transaction History is found).
         """
         for line in page_text.split("\n"):
             line = line.strip()
 
-            # Skip header rows
-            if "Date" in line and "Description" in line:
-                continue
-            if "Money in" in line or "Money out" in line:
-                continue
-            if "Transaction history" in line:
-                continue
-
-            # Handle Opening balance
+            # Always process Opening Balance regardless of section
             if "opening balance" in line.lower():
                 amounts = self.AMOUNT_PATTERN.findall(line)
                 if not amounts:
@@ -423,6 +468,25 @@ class CapitecParser(BaseBankParser):
                     rows.append(
                         create_transaction_row("", "Opening Balance", 0.0, 0.0, balance)
                     )
+                continue
+
+            # Skip all content before Transaction History section
+            # (Scheduled Payments, Debit Orders, Card Subscriptions, Spending Summary, etc.)
+            if not in_transactions:
+                if "transaction history" in line.lower():
+                    in_transactions = True
+                elif re.search(r"date\b.*description.*balance", line.lower()):
+                    in_transactions = True
+                continue
+
+            # Below: we are in the transaction section
+
+            # Skip header rows
+            if "Date" in line and "Description" in line:
+                continue
+            if "Money in" in line or "Money out" in line:
+                continue
+            if "Transaction history" in line:
                 continue
 
             # Standard format: DD/MM/YYYY
@@ -466,20 +530,26 @@ class CapitecParser(BaseBankParser):
                     debit += fees
 
             elif len(amounts) == 3:
-                # Could be: Amount, Fees, Balance or Money in, Money out, Balance
+                # Standard format: [Money In or Money Out], [Fee*], [Balance]
+                # Fee can be negative (charge → debit) or positive (refund → credit)
+                # e.g. [-75.00, -0.50, 28.48] = debit 75.50
+                # e.g. [50.00, 0.50, 126.76]  = credit 50.50 (Correction refund)
+                # e.g. [-1000.00, 14.00, 123.90] = debit 1000, credit 14 (Correction refund)
                 first_amt = self._clean_amount(amounts[0])
                 second_amt = self._clean_amount(amounts[1])
 
                 if first_amt < 0:
                     debit = abs(first_amt)
                     if second_amt < 0:
-                        debit += abs(second_amt)  # Fees (negative format)
-                    elif second_amt > 0 and second_amt < abs(first_amt):
-                        debit += second_amt  # Fees (positive format)
+                        debit += abs(second_amt)
+                    elif second_amt > 0:
+                        credit += second_amt
                 elif first_amt > 0:
                     credit = first_amt
                     if second_amt < 0:
-                        debit = abs(second_amt)
+                        debit += abs(second_amt)
+                    elif second_amt > 0:
+                        credit += second_amt
 
             elif len(amounts) == 2:
                 txn_amount = self._clean_amount(amounts[0])
@@ -555,17 +625,57 @@ class CapitecParser(BaseBankParser):
         statement_format = self._detect_format()
 
         if statement_format == "business":
-            # Try table extraction first (works better for bordered tables)
+            in_transactions = False
             with pdfplumber.open(self.pdf_file) as pdf:
                 for page in pdf.pages:
-                    if not self._parse_business_format_table(page, rows):
-                        # Fall back to text-based parsing
+                    found, in_transactions = self._parse_business_format_table(
+                        page, rows, in_transactions
+                    )
+                    if not found:
                         text = page.extract_text()
                         if text:
-                            self._parse_business_format(text, rows)
+                            in_transactions = self._parse_business_format(
+                                text, rows, in_transactions
+                            )
+            self._reset_file()
+        else:
+            in_transactions = False
+            for page_text in self._iterate_pages():
+                in_transactions = self._parse_standard_format(
+                    page_text, rows, in_transactions
+                )
+
+        # Fallback: if section-gating removed everything, re-parse without gating
+        # to maintain backward compatibility with older statement formats.
+        if not rows:
+            rows = self._extract_transactions_fallback(statement_format)
+
+        return pd.DataFrame(rows)
+
+    def _extract_transactions_fallback(self, statement_format: str) -> list:
+        """Fallback parser that processes every dated line (no section gating).
+
+        Used when section-gating removes all rows, which can happen with
+        older statement formats that don't have a Transaction History header.
+        """
+        fallback_rows = []
+
+        if statement_format == "business":
+            with pdfplumber.open(self.pdf_file) as pdf:
+                for page in pdf.pages:
+                    if not self._parse_business_format_table(
+                        page, fallback_rows, in_transactions=True
+                    )[0]:
+                        text = page.extract_text()
+                        if text:
+                            self._parse_business_format(
+                                text, fallback_rows, in_transactions=True
+                            )
             self._reset_file()
         else:
             for page_text in self._iterate_pages():
-                self._parse_standard_format(page_text, rows)
+                self._parse_standard_format(
+                    page_text, fallback_rows, in_transactions=True
+                )
 
-        return pd.DataFrame(rows)
+        return fallback_rows
