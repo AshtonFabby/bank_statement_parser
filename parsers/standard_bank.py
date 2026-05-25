@@ -17,6 +17,8 @@ class StandardBankParser(BaseBankParser):
         ("standard bank", 2),
         ("standardbank", 3),
         ("standard bank of south africa", 10),
+        ("www.standardbank.co.za", 10),
+        ("0860 123 000", 10),
     ]
 
     # Date format: "17 Nov 22" (DD MMM YY) or "17 Jul 25"
@@ -26,7 +28,7 @@ class StandardBankParser(BaseBankParser):
     )
     # Date format for transactional history: "09 Feb 2026" (DD MMM YYYY)
     DATE_PATTERN_4Y = re.compile(
-        r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\b",
+        r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})(?:\s|$)",
         re.IGNORECASE,
     )
     # Date format for transactional history without year on date line: "22 Oct"
@@ -41,9 +43,9 @@ class StandardBankParser(BaseBankParser):
     # Amount pattern - handles comma-separated amounts and negative values
     AMOUNT_PATTERN = re.compile(r"-?[\d,]+\.\d{2}")
     # SA format amounts: comma decimal, space thousands (e.g. -432 785,10 or +41 635,00)
-    SA_AMOUNT_PATTERN = re.compile(r"[+-]?\d{1,3}(?: \d{3})*,\d{2}")
+    SA_AMOUNT_PATTERN = re.compile(r"[+-]?\d{1,3}(?: \d{3})*,\d{2}(?=\s|$)")
     # SA format amounts: period decimal, space thousands (e.g. -7 936 635.59 or + 40 440.00)
-    SA_AMOUNT_PATTERN_PERIOD = re.compile(r"[+-]?\s?\d{1,3}(?: \d{3})*\.\d{2}")
+    SA_AMOUNT_PATTERN_PERIOD = re.compile(r"[+-]?\s?\d{1,3}(?: \d{3})*\.\d{2}(?=\s|$)")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Standard Bank statement."""
@@ -268,6 +270,7 @@ class StandardBankParser(BaseBankParser):
         for page_text in self._iterate_pages():
             lines = page_text.split("\n")
             prev_desc = ""
+            pending_suffix = False
 
             for line in lines:
                 line = line.strip()
@@ -292,6 +295,7 @@ class StandardBankParser(BaseBankParser):
                 if self.YEAR_LINE_PATTERN.match(line):
                     current_year = line.strip()
                     prev_month_num = 0
+                    pending_suffix = False
                     continue
 
                 # Try matching date at start of line (DD MMM YYYY)
@@ -321,10 +325,28 @@ class StandardBankParser(BaseBankParser):
                             date_str = f"{day.zfill(2)}/{month}/{current_year}"
                             prev_month_num = month_num
                         else:
-                            prev_desc = line
+                            if pending_suffix and rows:
+                                pending_suffix = False
+                                words = line.split()
+                                is_suffix = len(words) <= 3 and ":" not in line and " - " not in line
+                                if is_suffix:
+                                    rows[-1]["Description"] = (rows[-1]["Description"] + " " + line).strip()
+                                else:
+                                    prev_desc = line
+                            else:
+                                prev_desc = line
                             continue
                     else:
-                        prev_desc = line
+                        if pending_suffix and rows:
+                            pending_suffix = False
+                            words = line.split()
+                            is_suffix = len(words) <= 3 and ":" not in line and " - " not in line
+                            if is_suffix:
+                                rows[-1]["Description"] = (rows[-1]["Description"] + " " + line).strip()
+                            else:
+                                prev_desc = line
+                        else:
+                            prev_desc = line
                         continue
 
                 rest = line[date_match.end():].strip()
@@ -346,17 +368,23 @@ class StandardBankParser(BaseBankParser):
                 parsed = [amt_parser(m.group()) for m in amt_matches]
                 balance = parsed[-1]
 
-                # Transaction amounts are all except the last (balance)
+                # Transaction amounts: first non-balance amount is In(R)/Out(R) by sign.
+                # Any additional non-balance amounts represent the Bank fees(R) column,
+                # which is a sub-component breakdown of Out(R) — not an additional charge.
+                # Do not add fees to the debit; the Out(R) amount already includes them.
                 debit = 0.0
                 credit = 0.0
-                for amt in parsed[:-1]:
-                    if amt < 0:
-                        debit += abs(amt)
-                    elif amt > 0:
-                        credit += amt
+                non_balance = parsed[:-1]
+                if non_balance:
+                    first = non_balance[0]
+                    if first < 0:
+                        debit = abs(first)
+                    elif first > 0:
+                        credit = first
 
                 rows.append(create_transaction_row(date_str, description, debit, credit, balance))
                 prev_desc = ""
+                pending_suffix = True
 
         return pd.DataFrame(rows)
 
