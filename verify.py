@@ -24,8 +24,17 @@ BANK_STATEMENT_DIR = Path(__file__).parent / "bank_statement"
 PARSED_DIR = Path(__file__).parent / "parsed"
 
 
+def _unwrap_java_serialized_pdf(contents: bytes) -> bytes:
+    if contents[:2] == b"\xac\xed":
+        pdf_start = contents.find(b"%PDF")
+        if pdf_start > 0:
+            return contents[pdf_start:]
+    return contents
+
+
 def process_file(pdf_path: Path) -> dict:
     contents = pdf_path.read_bytes()
+    contents = _unwrap_java_serialized_pdf(contents)
     detection_buffer = io.BytesIO(contents)
     bank_id = detect_bank(detection_buffer)
 

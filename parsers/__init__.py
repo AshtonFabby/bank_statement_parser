@@ -47,6 +47,25 @@ PARSER_MAP: dict[str, Type[BaseBankParser]] = {
 SUPPORTED_BANKS: list[str] = [parser.BANK_NAME for parser in PARSER_REGISTRY]
 
 
+def _unwrap_java_serialized_pdf(pdf_file: io.BytesIO) -> io.BytesIO:
+    """If the buffer is a Java-serialized byte[] wrapping a PDF, extract the PDF.
+
+    Returns a new BytesIO with the raw PDF content, or the original buffer
+    unchanged.
+    """
+    pdf_file.seek(0)
+    header = pdf_file.read(2)
+    pdf_file.seek(0)
+    if header != b"\xac\xed":
+        return pdf_file
+    content = pdf_file.read()
+    pdf_offset = content.find(b"%PDF")
+    if pdf_offset > 0:
+        return io.BytesIO(content[pdf_offset:])
+    pdf_file.seek(0)
+    return pdf_file
+
+
 def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
     """Detect which bank the statement is from.
 
@@ -63,6 +82,8 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
     """
     import pdfplumber
     from pdfplumber.utils.exceptions import PdfminerException
+
+    pdf_file = _unwrap_java_serialized_pdf(pdf_file)
 
     pdf_file.seek(0)
     try:
@@ -108,6 +129,7 @@ def get_parser(pdf_file: io.BytesIO) -> Optional[BaseBankParser]:
         Parser instance or None if bank not detected
     """
     bank_id = detect_bank(pdf_file)
+    pdf_file = _unwrap_java_serialized_pdf(pdf_file)
     if bank_id and bank_id in PARSER_MAP:
         return PARSER_MAP[bank_id](pdf_file)
     return None
@@ -123,6 +145,7 @@ def get_parser_by_id(bank_id: str, pdf_file: io.BytesIO) -> Optional[BaseBankPar
     Returns:
         Parser instance or None if bank ID not found
     """
+    pdf_file = _unwrap_java_serialized_pdf(pdf_file)
     if bank_id in PARSER_MAP:
         return PARSER_MAP[bank_id](pdf_file)
     return None

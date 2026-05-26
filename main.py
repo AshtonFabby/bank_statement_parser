@@ -72,6 +72,20 @@ def list_banks():
 _PASS_PATTERN = re.compile(r"_pass=([^_.]+)", re.IGNORECASE)
 
 
+def _unwrap_java_serialized_pdf(contents: bytes) -> bytes:
+    """If the file is a Java-serialized byte[] wrapping a PDF, extract the PDF.
+
+    Some bank portals serve statements as Java serialized objects where the
+    PDF byte stream is stored inside a byte[] array. The Java serialization
+    header is stripped and the raw PDF content is returned.
+    """
+    if contents[:2] == b"\xac\xed":
+        pdf_start = contents.find(b"%PDF")
+        if pdf_start > 0:
+            return contents[pdf_start:]
+    return contents
+
+
 def _decrypt_pdf_if_needed(contents: bytes, filename: str) -> tuple[bytes, str]:
     """If the filename contains _pass=<password>, decrypt the PDF and strip the
     password segment from the filename. Returns (pdf_bytes, clean_filename)."""
@@ -99,6 +113,7 @@ async def _parse_pdf_bytes(
     contents: bytes, filename: str, raise_on_error: bool = True
 ) -> dict:
     """Parse raw PDF bytes and return structured result."""
+    contents = _unwrap_java_serialized_pdf(contents)
     contents, filename = _decrypt_pdf_if_needed(contents, filename)
     result = {
         "filename": filename,
