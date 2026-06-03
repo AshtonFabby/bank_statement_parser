@@ -20,9 +20,9 @@ class CapitecParser(BaseBankParser):
     # Also handles fees with one decimal place like -6.0 or -6.00
     # (?<!\d) p      revents grabbing trailing digits from reference numbers
     # e.g. "4001787814 505.00" won't match as "814 505.00"
-    AMOUNT_PATTERN = re.compile(r"(?<!\d)[+-]?\d{1,3}(?:[ ,]\d{3})*\.\d{1,2}")
+    AMOUNT_PATTERN = re.compile(r"(?<![a-zA-Z0-9])[+\-\u2212]?\s*R?\s*\d{1,3}(?:[ ,]\d{3})*\.\d{1,2}")
     # Also support comma-separated format
-    AMOUNT_PATTERN_COMMA = re.compile(r"[+-]?[\d,]+\.\d{1,2}")
+    AMOUNT_PATTERN_COMMA = re.compile(r"[+\-\u2212]?\s*R?\s*[\d,]+\.\d{1,2}")
     # Date patterns
     DATE_PATTERN_FULL = re.compile(r"^(\d{2}/\d{2}/\d{4})")  # DD/MM/YYYY
     DATE_PATTERN_SHORT = re.compile(r"^(\d{2}/\d{2}/\d{2})")  # DD/MM/YY
@@ -261,7 +261,7 @@ class CapitecParser(BaseBankParser):
 
                 if amount_str.startswith("+"):
                     credit = abs(amount_val)
-                elif amount_str.startswith("-") or amount_val < 0:
+                elif amount_str.startswith("-") or amount_str.startswith("\u2212") or amount_val < 0:
                     debit = abs(amount_val)
                 elif amount_val != 0.0 and rows:
                     # Determine from balance change
@@ -324,6 +324,8 @@ class CapitecParser(BaseBankParser):
                     amounts = self.AMOUNT_PATTERN_COMMA.findall(line)
                 if amounts:
                     balance = self._clean_amount(amounts[-1])
+                    if "\u2212" in line:
+                        balance = -abs(balance)
                     rows.append(
                         create_transaction_row(
                             "", "Balance brought forward", 0.0, 0.0, balance
@@ -390,7 +392,7 @@ class CapitecParser(BaseBankParser):
                 amount_val = self._clean_amount(amount_str)
 
                 if amount_str.startswith("+") or (
-                    not amount_str.startswith("-") and amount_val > 0
+                    not amount_str.startswith("-") and not amount_str.startswith("\u2212") and amount_val > 0
                 ):
                     credit = abs(amount_val)
                 else:
@@ -406,7 +408,7 @@ class CapitecParser(BaseBankParser):
 
                 if amount_str.startswith("+"):
                     credit = abs(amount_val)
-                elif amount_str.startswith("-"):
+                elif amount_str.startswith("-") or amount_str.startswith("\u2212"):
                     debit = abs(amount_val)
                 elif rows:
                     # Determine from balance change
@@ -435,6 +437,8 @@ class CapitecParser(BaseBankParser):
             rows.append(
                 create_transaction_row(date_str, description, debit, credit, balance)
             )
+
+        return in_transactions
 
     def _parse_standard_format(self, page_text: str, rows: list, in_transactions: bool = False) -> bool:
         """Parse standard personal account format.
@@ -465,6 +469,12 @@ class CapitecParser(BaseBankParser):
                     amounts = self.AMOUNT_PATTERN_COMMA.findall(line)
                 if amounts:
                     balance = self._clean_amount(amounts[-1])
+                    # Capitec business accounts use negative notation for credit
+                    # balances. The opening balance line may have a Unicode minus
+                    # sign separated from the number by 'R' (e.g. "− R 5 076 705.75"),
+                    # which the regex won't capture as a signed number.
+                    if "\u2212" in line:
+                        balance = -abs(balance)
                     rows.append(
                         create_transaction_row("", "Opening Balance", 0.0, 0.0, balance)
                     )
@@ -506,7 +516,7 @@ class CapitecParser(BaseBankParser):
 
             # Get description (text between date and first amount)
             rest_of_line = line[11:].strip()
-            first_amt_match = re.search(r"[+-]?[\d,\s]+\.\d{2}", rest_of_line)
+            first_amt_match = re.search(r"[+\-\u2212]?[\d,\s]+\.\d{2}", rest_of_line)
             if first_amt_match:
                 description = rest_of_line[: first_amt_match.start()].strip()
             else:
@@ -569,6 +579,8 @@ class CapitecParser(BaseBankParser):
             rows.append(
                 create_transaction_row(date, description, debit, credit, balance)
             )
+
+        return in_transactions
 
     def _detect_format(self) -> str:
         """Detect statement format (business vs standard)."""

@@ -83,9 +83,12 @@ def normalize_amount_string(amount_str: str) -> float:
 
     # Determine sign
     is_negative = False
-    if original.startswith("-") or original.startswith("- "):
+    if (
+        original.startswith("-") or original.startswith("- ")
+        or original.startswith("\u2212") or original.startswith("\u2212 ")
+    ):
         is_negative = True
-    elif original.endswith("-"):
+    elif original.endswith("-") or original.endswith("\u2212"):
         is_negative = True
     elif original.startswith("+"):
         is_negative = False
@@ -93,7 +96,7 @@ def normalize_amount_string(amount_str: str) -> float:
     # Clean the string
     clean = original
     clean = clean.replace("R", "").replace("r", "")
-    clean = clean.replace("-", "").replace("+", "")
+    clean = clean.replace("\u2212", "").replace("-", "").replace("+", "")
     clean = clean.replace(" ", "")  # Remove spaces (thousands separator)
     clean = clean.replace(",", "")  # Remove commas (thousands separator)
     clean = clean.strip()
