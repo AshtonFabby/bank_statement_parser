@@ -49,6 +49,12 @@ class FNBParser(BaseBankParser):
         r"Jan|Feb|Mrt|Apr|Mei|Jun|Jul|Aug|Sep|Okt|Nov|Des)\b",
         re.IGNORECASE
     )
+    # Compact format: DDMon[YYYY] (e.g., "05Jan" or "05Jan2026")
+    # No spaces between day and month — used by FNB Gold Business Account statements
+    DATE_PATTERN_DD_MON = re.compile(
+        r"^(\d{2})(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{4})?\b",
+        re.IGNORECASE
+    )
     # Transaction History ISO format: YYYY-MM-DD (e.g., "2026-04-13")
     DATE_PATTERN_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\b", re.MULTILINE)
     # Transaction History amounts: with CR/DR suffix (English) or KT/DT (Afrikaans)
@@ -178,6 +184,22 @@ class FNBParser(BaseBankParser):
             start_year = int(period_match.group(3))
             end_month = int(MONTH_MAP.get(period_match.group(5).lower()[:3], "01"))
             end_year = int(period_match.group(6))
+            return start_month, start_year, end_month, end_year
+
+        # Compact format: "StatementPeriod:3January2026to3February2026"
+        # Used by FNB Gold Business Account statements — no spaces between words
+        compact_match = re.search(
+            r"StatementPeriod:?(\d{1,2})(January|February|March|April|May|June|July|"
+            r"August|September|October|November|December)(\d{4})to"
+            r"(\d{1,2})(January|February|March|April|May|June|July|"
+            r"August|September|October|November|December)(\d{4})",
+            text, re.IGNORECASE
+        )
+        if compact_match:
+            start_month = int(MONTH_MAP.get(compact_match.group(2).lower()[:3], "01"))
+            start_year = int(compact_match.group(3))
+            end_month = int(MONTH_MAP.get(compact_match.group(5).lower()[:3], "01"))
+            end_year = int(compact_match.group(6))
             return start_month, start_year, end_month, end_year
 
         # Afrikaans format: "Staat Periode : 31 Julie 2025 tot 30 Augustus 2025"
@@ -529,6 +551,8 @@ class FNBParser(BaseBankParser):
             if not dm:
                 dm = self.DATE_PATTERN_WITH_YEAR.match(date_text)
             if not dm:
+                dm = self.DATE_PATTERN_DD_MON.match(date_text)
+            if not dm:
                 continue
 
             has_year = bool(dm.lastindex and dm.lastindex >= 3 and dm.group(3))
@@ -712,7 +736,8 @@ class FNBParser(BaseBankParser):
 
                 # Collect description fragments for ISO mode
                 if iso_mode and not self.DATE_PATTERN_WITH_YEAR.match(line) \
-                        and not self.DATE_PATTERN_NO_YEAR.match(line):
+                        and not self.DATE_PATTERN_NO_YEAR.match(line) \
+                        and not self.DATE_PATTERN_DD_MON.match(line):
                     iso_desc_fragments.append(line)
                     continue
 
@@ -723,6 +748,10 @@ class FNBParser(BaseBankParser):
                 if not date_match:
                     date_match = self.DATE_PATTERN_NO_YEAR.match(line)
                     has_year = False
+
+                if not date_match:
+                    date_match = self.DATE_PATTERN_DD_MON.match(line)
+                    has_year = bool(date_match and date_match.group(3))
 
                 if not date_match:
                     continue
