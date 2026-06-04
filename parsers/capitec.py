@@ -192,7 +192,7 @@ class CapitecParser(BaseBankParser):
                 # Skip header rows
                 if "post" in combined and "date" in combined:
                     continue
-                if "no limit" in combined or "overdraft" in combined:
+                if ("no limit" in combined or "overdraft" in combined) and "rate" in combined:
                     continue
 
                 # Handle "Balance brought forward"
