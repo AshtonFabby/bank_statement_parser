@@ -19,12 +19,14 @@ from .hbz import HBZParser
 from .african_bank import AfricanBankParser
 from .tymebank import TymeBankParser
 from .hellopaisa import HelloPaisaParser
+from .albaraka import AlbarakaParser
 
 # Registry of all available parsers (order matters for detection)
 # More specific keywords should come first; generic ones (e.g. "fnb") last
 # to avoid false positives from transaction references.
 PARSER_REGISTRY: list[Type[BaseBankParser]] = [
     HelloPaisaParser,
+    AlbarakaParser,
     TymeBankParser,
     AfricanBankParser,
     HBZParser,
@@ -168,6 +170,7 @@ __all__ = [
     "AfricanBankParser",
     "TymeBankParser",
     "HelloPaisaParser",
+    "AlbarakaParser",
     # Registry and utilities
     "PARSER_REGISTRY",
     "PARSER_MAP",
