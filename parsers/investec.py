@@ -25,20 +25,36 @@ class InvestecParser(BaseBankParser):
     DATE_PATTERN_SLASH = re.compile(
         r"(\d{2})/(\d{2})/(\d{4})"
     )
-    # Amount pattern with optional R prefix
-    AMOUNT_PATTERN = re.compile(r"R?[\d,]+\.\d{2}")
+    # Amount pattern with optional R prefix and optional minus sign
+    AMOUNT_PATTERN = re.compile(r"-?R?[\d,]+\.\d{2}")
+    # Date pattern: DDMMMYYYY with no spaces (e.g., "1MAY2026")
+    DATE_PATTERN_NOSPACE = re.compile(
+        r"(\d{1,2})(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{4})",
+        re.IGNORECASE
+    )
+    # Amount pattern with DR/CR suffix (e.g., "896.73DR", "582,725.04CR")
+    AMOUNT_DRCR_PATTERN = re.compile(
+        r"([\d,]+\.\d{2})(DR|CR)", re.IGNORECASE
+    )
 
     # Lines to skip during text-based parsing
     _SKIP_MARKERS = [
-        "monthly account statement",
+        "monthlyaccountstatement",
         "shouldyouhaveanyqueries",
-        "transaction date", "trans date", "valuedate",
-        "transaction description",
+        "transactiondate", "transdate", "valuedate",
+        "transactiondescription",
         "investeccorporate",
         "accountnumber:",
         "statementperiod:",
         "statementtype:",
         "ombudsman",
+        "capitalinterest",
+        "datedescriptionamountbalance",
+        "shouldyoudisagree",
+        "corporate&institutionalbanking",
+        "aregisteredcreditprovider",
+        "australiabotswanacanada",
+        "ofpwcourexternalauditors",
     ]
 
     def _is_skip_line(self, line: str) -> bool:
@@ -67,6 +83,13 @@ class InvestecParser(BaseBankParser):
         if match:
             day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
             return (match, "slash", day, month, year)
+        match = self.DATE_PATTERN_NOSPACE.match(line)
+        if match:
+            day = int(match.group(1))
+            month_str = match.group(2)
+            year = match.group(3)
+            month_num = int(MONTH_MAP.get(month_str.lower(), "01"))
+            return (match, "nospace", day, month_num, int(year))
         match = self.DATE_PATTERN.match(line)
         if match:
             day, month_str, year = match.group(1), match.group(2), match.group(3)
@@ -80,6 +103,13 @@ class InvestecParser(BaseBankParser):
         if slash:
             day, month, year = int(slash.group(1)), int(slash.group(2)), int(slash.group(3))
             return (slash, "slash", day, month, year)
+        nospace = self.DATE_PATTERN_NOSPACE.search(text)
+        if nospace:
+            day = int(nospace.group(1))
+            month_str = nospace.group(2)
+            year = nospace.group(3)
+            month_num = int(MONTH_MAP.get(month_str.lower(), "01"))
+            return (nospace, "nospace", day, month_num, int(year))
         named = self.DATE_PATTERN.search(text)
         if named:
             day = int(named.group(1))
@@ -115,7 +145,13 @@ class InvestecParser(BaseBankParser):
             if date_info:
                 combined = line
                 # Determine if trailing undated lines are suffixes or prefixes
-                if self._line_has_inline_desc(line, date_info):
+                if date_info[1] == "nospace":
+                    # Nospace format: trailing lines are always suffixes
+                    while i + 1 < len(clean) and not self._find_date_at_start(clean[i + 1]):
+                        i += 1
+                        combined += " " + clean[i]
+                    merged.append(combined)
+                elif self._line_has_inline_desc(line, date_info):
                     # Inline description present → trailing lines are prefixes
                     # for the *next* transaction, so stop merging here.
                     merged.append(combined)
@@ -138,7 +174,11 @@ class InvestecParser(BaseBankParser):
                     combined = prefix + " " + dated
                     date_info = self._find_date_at_start(dated)
                     if date_info:
-                        if not self._line_has_inline_desc(dated, date_info):
+                        if date_info[1] == "nospace":
+                            while i + 1 < len(clean) and not self._find_date_at_start(clean[i + 1]):
+                                i += 1
+                                combined += " " + clean[i]
+                        elif not self._line_has_inline_desc(dated, date_info):
                             while i + 1 < len(clean) and not self._find_date_at_start(clean[i + 1]):
                                 i += 1
                                 combined += " " + clean[i]
@@ -255,6 +295,7 @@ class InvestecParser(BaseBankParser):
             return None
 
         match = date_info[0]
+        kind = date_info[1]
         date_str = self._parse_date_from_match(date_info)
 
         # Text before the first date → description prefix
@@ -262,22 +303,26 @@ class InvestecParser(BaseBankParser):
 
         rest = line[match.end():].strip()
 
-        # Optional second date (value date)
+        # Optional second date (value date) - skip for nospace format
         second_info = None
-        slash2 = self.DATE_PATTERN_SLASH.match(rest)
-        if slash2:
-            second_info = (slash2, "slash",
-                           int(slash2.group(1)), int(slash2.group(2)), int(slash2.group(3)))
-            rest = rest[slash2.end():].strip()
-        else:
-            named2 = self.DATE_PATTERN.match(rest)
-            if named2:
-                d2 = int(named2.group(1))
-                m2_str = named2.group(2)
-                y2 = named2.group(3)
-                m2_num = int(MONTH_MAP.get(m2_str.lower(), "01"))
-                second_info = (named2, "named", d2, m2_num, y2)
-                rest = rest[named2.end():].strip()
+        if kind != "nospace":
+            slash2 = self.DATE_PATTERN_SLASH.match(rest)
+            if slash2:
+                second_info = (slash2, "slash",
+                               int(slash2.group(1)), int(slash2.group(2)), int(slash2.group(3)))
+                rest = rest[slash2.end():].strip()
+            else:
+                named2 = self.DATE_PATTERN.match(rest)
+                if named2:
+                    d2 = int(named2.group(1))
+                    m2_str = named2.group(2)
+                    y2 = named2.group(3)
+                    m2_num = int(MONTH_MAP.get(m2_str.lower(), "01"))
+                    second_info = (named2, "named", d2, m2_num, y2)
+                    rest = rest[named2.end():].strip()
+
+        if kind == "nospace":
+            return self._parse_nospace_line(date_str, match, prefix_desc, rest, rows)
 
         # Find amounts
         amounts = self.AMOUNT_PATTERN.findall(rest)
@@ -341,6 +386,59 @@ class InvestecParser(BaseBankParser):
 
         return create_transaction_row(date_str, description, debit, credit, balance)
 
+    def _parse_nospace_line(self, date_str: str, date_match, prefix_desc: str, rest: str, rows: list[dict]) -> dict | None:
+        """Parse a transaction line in nospace format (DDMMMYYYY dates, DR/CR amounts)."""
+        dr_cr_matches = list(self.AMOUNT_DRCR_PATTERN.finditer(rest))
+        if not dr_cr_matches:
+            return None
+
+        first_amt_match = dr_cr_matches[0]
+        inline_desc = rest[:first_amt_match.start()].strip()
+
+        last_amt_match = dr_cr_matches[-1]
+        suffix_desc = rest[last_amt_match.end():].strip()
+
+        parts = []
+        if prefix_desc:
+            parts.append(prefix_desc)
+        if inline_desc:
+            parts.append(inline_desc)
+        if suffix_desc:
+            parts.append(suffix_desc)
+        description = " ".join(parts)
+
+        if "interestadvised" in description.lower().replace(" ", ""):
+            return None
+
+        parsed = [(self._clean_amount(m.group(1)), m.group(2).upper()) for m in dr_cr_matches]
+
+        if len(parsed) == 1:
+            amt, typ = parsed[0]
+            if typ == "DR":
+                debit = amt
+                balance = -amt
+            else:
+                credit = amt
+                balance = amt
+            return create_transaction_row(date_str, description, debit, credit, balance)
+
+        balance_amount, balance_type = parsed[-1]
+        balance = balance_amount if balance_type == "CR" else -balance_amount
+
+        non_balance = parsed[:-1]
+        if len(non_balance) > 1 and "interest" in description.lower() and non_balance[0][1] == "CR" and non_balance[0][0] < 100:
+            non_balance = non_balance[1:]
+
+        debit = 0.0
+        credit = 0.0
+        for amt, typ in non_balance:
+            if typ == "DR":
+                debit += amt
+            else:
+                credit += amt
+
+        return create_transaction_row(date_str, description, debit, credit, balance)
+
     def _iter_transaction_lines(self):
         """Yield transaction text lines from the PDF.
 
@@ -379,4 +477,40 @@ class InvestecParser(BaseBankParser):
             txn = self._parse_transaction_line(line, rows)
             if txn:
                 rows.append(txn)
+        if rows:
+            self._correct_opening_balance_sign(rows)
         return pd.DataFrame(rows)
+
+    def _correct_opening_balance_sign(self, rows: list[dict]) -> None:
+        """Post-parse: fix opening balance sign if parsed wrong.
+
+        Some statements show opening balance as ``-R48,187.57`` where the
+        ``-`` is an overdraft indicator (not arithmetic), while others use it
+        as a true negative sign.  We validate against the first real
+        transaction — correcting its debit/credit if the opening sign flip
+        requires it.
+        """
+        if len(rows) < 2:
+            return
+        opening = rows[0]
+        if opening.get("Description", "").strip() != "Opening Balance":
+            return
+        first = rows[1]
+        opening_parsed = opening["Balance"]
+        first_balance = first["Balance"]
+        total_amt = first["Debit"] + first["Credit"]
+
+        expected = round(opening_parsed + first["Credit"] - first["Debit"], 2)
+        if abs(expected - first_balance) < 0.01:
+            return
+
+        flipped = -opening_parsed
+        if abs(round(flipped + total_amt - first_balance, 2)) < 0.01:
+            opening["Balance"] = flipped
+            first["Credit"] = total_amt
+            first["Debit"] = 0.0
+            return
+        if abs(round(flipped - total_amt - first_balance, 2)) < 0.01:
+            opening["Balance"] = flipped
+            first["Debit"] = total_amt
+            first["Credit"] = 0.0
