@@ -40,8 +40,10 @@ class StandardBankParser(BaseBankParser):
     YEAR_LINE_PATTERN = re.compile(r"^\d{4}$")
     # Date format for current account statements: YYYYMMDD (e.g. 20250804)
     DATE_PATTERN_8D = re.compile(r"\b(20\d{2})(\d{2})(\d{2})\b")
+    # Date format ISO: YYYY-MM-DD
+    DATE_PATTERN_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\b")
     # Amount pattern - handles comma-separated amounts and negative values
-    AMOUNT_PATTERN = re.compile(r"-?[\d,]+\.\d{2}")
+    AMOUNT_PATTERN = re.compile(r"-?\s*R?\s*-?[\d,]+\.\d{2}(?=\s|$)")
     # SA format amounts: comma decimal, space thousands (e.g. -432 785,10 or +41 635,00)
     SA_AMOUNT_PATTERN = re.compile(r"[+-]?\d{1,3}(?: \d{3})*,\d{2}(?=\s|$)")
     # SA format amounts: period decimal, space thousands (e.g. -7 936 635.59 or + 40 440.00)
@@ -161,6 +163,10 @@ class StandardBankParser(BaseBankParser):
     def _detect_format(self) -> str:
         """Detect which Standard Bank statement format this is."""
         first_page = self._extract_first_page_text()
+
+        # Regular statement with Fees column
+        if re.search(r"Fees.*Payments.*Deposits.*Balance", first_page, re.DOTALL | re.IGNORECASE):
+            return "regular_with_fees"
 
         # Regular statement has "Payments" and "Deposits" column headers
         if re.search(r"Payments.*Deposits.*Balance", first_page, re.DOTALL | re.IGNORECASE):
@@ -707,6 +713,8 @@ class StandardBankParser(BaseBankParser):
             return self._extract_transactions_business_int()
         elif fmt == "current_account":
             return self._extract_transactions_current_account()
+        elif fmt == "regular_with_fees":
+            return self._extract_transactions_regular_with_fees()
         return self._extract_transactions_regular()
 
     def _extract_transactions_regular(self) -> pd.DataFrame:
@@ -744,6 +752,17 @@ class StandardBankParser(BaseBankParser):
                 # Match date at start of line
                 date_match = self.DATE_PATTERN.match(line)
                 if not date_match:
+                    # Description rollover
+                    if rows and not self.AMOUNT_PATTERN.search(line):
+                        line_lower = line.lower()
+                        ignore_keywords = [
+                            "page", "statement", "balance", "customer care",
+                            "bank", "fees", "deposits", "payments", "address:",
+                            "post date", "account number", "netbank", "absa",
+                            "standard bank", "fnb", "richards bay"
+                        ]
+                        if not any(k in line_lower for k in ignore_keywords):
+                            rows[-1]["Description"] = (rows[-1]["Description"] + " " + line).strip()
                     continue
 
                 # Parse date - convert 2-digit year to 4-digit
@@ -820,6 +839,122 @@ class StandardBankParser(BaseBankParser):
 
                 elif len(cleaned_amounts) == 1 and rows:
                     # Only balance - calculate from balance change
+                    prev_balance = rows[-1]["Balance"]
+                    diff = balance - prev_balance
+                    if diff < 0:
+                        debit = abs(diff)
+                    else:
+                        credit = diff
+
+                rows.append(create_transaction_row(date_str, description, debit, credit, balance))
+
+        return pd.DataFrame(rows)
+
+    def _extract_transactions_regular_with_fees(self) -> pd.DataFrame:
+        """Extract transactions from regular Standard Bank statements with a Fees column.
+
+        Format: Date | Description | Fees | Payments | Deposits | Balance
+        """
+        rows = []
+
+        for page_text in self._iterate_pages():
+            for line in page_text.split("\n"):
+                line = line.strip()
+
+                # Skip header rows
+                if not line:
+                    continue
+                if "Date" in line and "Description" in line:
+                    continue
+                if "Payments" in line and "Deposits" in line:
+                    continue
+
+                # Handle STATEMENT OPENING BALANCE
+                if "STATEMENT OPENING BALANCE" in line.upper():
+                    amounts = self.AMOUNT_PATTERN.findall(line)
+                    if amounts:
+                        balance = self._clean_amount(amounts[-1])
+                        rows.append(create_transaction_row(
+                            "", "Statement Opening Balance", 0.0, 0.0, balance
+                        ))
+                    continue
+
+                # Match ISO date or regular date at start of line
+                date_match = self.DATE_PATTERN_ISO.match(line)
+                is_iso = True
+                if not date_match:
+                    date_match = self.DATE_PATTERN.match(line)
+                    is_iso = False
+
+                if not date_match:
+                    # Description rollover
+                    if rows and not self.AMOUNT_PATTERN.search(line):
+                        line_lower = line.lower()
+                        ignore_keywords = [
+                            "page", "statement", "balance", "customer care",
+                            "bank", "fees", "deposits", "payments", "address:",
+                            "post date", "account number", "netbank", "absa",
+                            "standard bank", "fnb", "richards bay"
+                        ]
+                        if not any(k in line_lower for k in ignore_keywords):
+                            rows[-1]["Description"] = (rows[-1]["Description"] + " " + line).strip()
+                    continue
+
+                # Parse date
+                if is_iso:
+                    year = date_match.group(1)
+                    month = date_match.group(2)
+                    day = date_match.group(3)
+                else:
+                    day = date_match.group(1).zfill(2)
+                    month = MONTH_MAP.get(date_match.group(2).lower(), "01")
+                    year = f"20{date_match.group(3)}"
+                
+                date_str = f"{day}/{month}/{year}"
+
+                # Find all amounts
+                amounts = self.AMOUNT_PATTERN.findall(line)
+                if len(amounts) < 1:
+                    continue
+
+                # Clean amounts and track if negative
+                cleaned_amounts = []
+                is_negative = []
+                for amt in amounts:
+                    val = self._clean_amount(amt)
+                    cleaned_amounts.append(abs(val))
+                    is_negative.append(val < 0 or amt.strip().startswith("-"))
+
+                # Get description
+                rest_of_line = line[date_match.end():].strip()
+                first_amount_match = self.AMOUNT_PATTERN.search(rest_of_line)
+                if first_amount_match:
+                    description = rest_of_line[:first_amount_match.start()].strip()
+                else:
+                    description = rest_of_line
+
+                debit = 0.0
+                credit = 0.0
+                balance = self._clean_amount(amounts[-1]) if amounts else 0.0
+
+                if len(cleaned_amounts) == 4:
+                    payment = cleaned_amounts[1]
+                    deposit = cleaned_amounts[2]
+                    debit = payment
+                    credit = deposit
+                elif len(cleaned_amounts) == 3:
+                    amt_val = cleaned_amounts[1]
+                    if is_negative[1]:
+                        debit = amt_val
+                    else:
+                        credit = amt_val
+                elif len(cleaned_amounts) == 2:
+                    amt_val = cleaned_amounts[0]
+                    if is_negative[0]:
+                        debit = amt_val
+                    else:
+                        credit = amt_val
+                elif len(cleaned_amounts) == 1 and rows:
                     prev_balance = rows[-1]["Balance"]
                     diff = balance - prev_balance
                     if diff < 0:

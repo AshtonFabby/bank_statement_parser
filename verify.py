@@ -12,16 +12,20 @@ For each PDF in bank_statement/, this script:
 
 import io
 import json
+import re
 import sys
 from pathlib import Path
+from pypdf import PdfReader, PdfWriter
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from parsers import detect_bank, get_parser_by_id
 from services.verification import verify_and_correct
 
-BANK_STATEMENT_DIR = Path(__file__).parent / "bank_statement"
+BANK_STATEMENT_DIR = Path(__file__).parent / "bank_statements"
 PARSED_DIR = Path(__file__).parent / "parsed"
+
+_PASS_PATTERN = re.compile(r"_pass=([^_.]+)", re.IGNORECASE)
 
 
 def _unwrap_java_serialized_pdf(contents: bytes) -> bytes:
@@ -32,9 +36,31 @@ def _unwrap_java_serialized_pdf(contents: bytes) -> bytes:
     return contents
 
 
+def _decrypt_pdf_if_needed(contents: bytes, filename: str) -> tuple[bytes, str]:
+    match = _PASS_PATTERN.search(filename)
+    if not match:
+        return contents, filename
+
+    password = match.group(1)
+    clean_filename = filename[: match.start()] + filename[match.end() :]
+
+    reader = PdfReader(io.BytesIO(contents))
+    if reader.is_encrypted:
+        reader.decrypt(password)
+
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue(), clean_filename
+
+
 def process_file(pdf_path: Path) -> dict:
     contents = pdf_path.read_bytes()
     contents = _unwrap_java_serialized_pdf(contents)
+    contents, clean_name = _decrypt_pdf_if_needed(contents, pdf_path.name)
     detection_buffer = io.BytesIO(contents)
     bank_id = detect_bank(detection_buffer)
 

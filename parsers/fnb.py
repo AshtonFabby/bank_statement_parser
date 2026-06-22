@@ -650,6 +650,7 @@ class FNBParser(BaseBankParser):
         iso_mode = False
         iso_desc_fragments: list[str] = []
         bank_stmt_positional = False
+        is_tx_history = False
         cached_columns = None
 
         for page_text, page in self._iterate_pages_with_objects():
@@ -670,7 +671,10 @@ class FNBParser(BaseBankParser):
                     start_month, start_year, end_month, end_year = s_mo, s_yr, e_mo, e_yr
 
             # Detect Bank Statement format columns for positional parsing
-            if not iso_mode and not bank_stmt_positional:
+            if not is_tx_history:
+                is_tx_history = "transaction history" in page_text.lower() or "transaksie geskiedenis" in page_text.lower()
+
+            if not iso_mode and not bank_stmt_positional and not is_tx_history:
                 cols = self._detect_fnb_columns(page)
                 if cols is not None:
                     bank_stmt_positional = True
@@ -794,7 +798,7 @@ class FNBParser(BaseBankParser):
                         rows.append(row)
                         previous_balance = row["Balance"]
 
-        if iso_mode and rows:
+        if (iso_mode or is_tx_history) and rows:
             rows.reverse()
 
         return pd.DataFrame(rows)
