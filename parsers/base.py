@@ -38,6 +38,8 @@ class BaseBankParser(ABC):
 
     def __init__(self, pdf_file: io.BytesIO):
         self.pdf_file = pdf_file
+        self._first_page_text_cache: Optional[str] = None
+        self._full_text_cache: Optional[str] = None
         self._reset_file()
 
     def _reset_file(self) -> None:
@@ -45,33 +47,48 @@ class BaseBankParser(ABC):
         self.pdf_file.seek(0)
 
     def _extract_full_text(self) -> str:
-        """Extract all text from PDF."""
+        """Extract all text from the PDF."""
+        if self._full_text_cache is not None:
+            return self._full_text_cache
+
+        import pdfplumber
         full_text = ""
         with pdfplumber.open(self.pdf_file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if text:
                     full_text += text + "\n"
+                page.flush_cache()
         self._reset_file()
+        self._full_text_cache = full_text
         return full_text
 
     def _extract_first_page_text(self) -> str:
-        """Extract text from first page only."""
+        """Extract text from the first page of the PDF."""
+        if self._first_page_text_cache is not None:
+            return self._first_page_text_cache
+
+        import pdfplumber
         with pdfplumber.open(self.pdf_file) as pdf:
             if pdf.pages:
-                text = pdf.pages[0].extract_text() or ""
+                page = pdf.pages[0]
+                text = page.extract_text() or ""
+                page.flush_cache()
                 self._reset_file()
+                self._first_page_text_cache = text
                 return text
         self._reset_file()
         return ""
 
     def _iterate_pages(self):
-        """Generator to iterate through PDF pages."""
+        """Yield text content page by page."""
+        import pdfplumber
         with pdfplumber.open(self.pdf_file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if text:
                     yield text
+                page.flush_cache()
         self._reset_file()
 
     def _iterate_pages_with_objects(self):
@@ -85,6 +102,7 @@ class BaseBankParser(ABC):
                 text = page.extract_text()
                 if text:
                     yield text, page
+                page.flush_cache()
         self._reset_file()
 
     @classmethod

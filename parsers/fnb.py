@@ -291,7 +291,7 @@ class FNBParser(BaseBankParser):
                     img["bottom"],
                 )
                 cropped = page.crop(bbox)
-                pil_img = cropped.to_image(resolution=800).original
+                pil_img = cropped.to_image(resolution=400).original
                 # Convert to grayscale and add white border to help tesseract
                 gray = pil_img.convert("L")
                 bordered = ImageOps.expand(gray, border=30, fill=255)
@@ -355,15 +355,14 @@ class FNBParser(BaseBankParser):
     # ── Positional parsing helpers for Bank Statement format ────────────
 
     @staticmethod
-    def _detect_fnb_columns(page) -> dict | None:
+    def _detect_fnb_columns(page_words: list[dict]) -> dict | None:
         """Detect FNB column positions from header words on a page.
 
         Finds the header row where Date, Description, Amount, and Balance all
         appear on (approximately) the same y-position. Returns a dict with
         column boundary x-positions, or None if headers are not found.
         """
-        words = page.extract_words()
-        if not words:
+        if not page_words:
             return None
 
         y_tolerance = 15.0
@@ -373,7 +372,7 @@ class FNBParser(BaseBankParser):
         # Group potential header words by y-position (buckets of y_tolerance)
         from collections import defaultdict
         y_buckets: dict[int, list] = defaultdict(list)
-        for w in words:
+        for w in page_words:
             text_lower = w["text"].lower().strip()
             key = text_lower if text_lower in (header_keywords | optional_keywords) else None
             if key:
@@ -412,16 +411,15 @@ class FNBParser(BaseBankParser):
         }
 
     @staticmethod
-    def _group_words_into_rows(page, y_tolerance: float = 4.0) -> list[tuple[float, list]]:
+    def _group_words_into_rows(page_words: list[dict], y_tolerance: float = 4.0) -> list[tuple[float, list]]:
         """Group page words into visual rows by y-position.
 
         Returns a list of (y_mean, [words]) tuples sorted by y-position.
         """
-        words = page.extract_words()
-        if not words:
+        if not page_words:
             return []
 
-        words_sorted = sorted(words, key=lambda w: (w["top"], w["x0"]))
+        words_sorted = sorted(page_words, key=lambda w: (w["top"], w["x0"]))
         rows: list[tuple[float, list]] = []
         current_row: list = []
         current_y = None
@@ -464,6 +462,7 @@ class FNBParser(BaseBankParser):
     def _extract_bank_statement_page_positional(
         self,
         page,
+        page_words: list[dict],
         page_text: str,
         columns: dict,
         previous_balance: float | None,
@@ -488,7 +487,7 @@ class FNBParser(BaseBankParser):
         balance_end = columns["balance_end"]
         charges_start = columns["charges_start"]
 
-        word_rows = self._group_words_into_rows(page)
+        word_rows = self._group_words_into_rows(page_words)
 
         if start_year is None:
             s_mo, s_yr, e_mo, e_yr = self._extract_statement_period(page_text)
@@ -670,12 +669,15 @@ class FNBParser(BaseBankParser):
                 if s_yr is not None:
                     start_month, start_year, end_month, end_year = s_mo, s_yr, e_mo, e_yr
 
+            # Extract words once per page
+            page_words = page.extract_words()
+
             # Detect Bank Statement format columns for positional parsing
             if not is_tx_history:
                 is_tx_history = "transaction history" in page_text.lower() or "transaksie geskiedenis" in page_text.lower()
 
             if not iso_mode and not bank_stmt_positional and not is_tx_history:
-                cols = self._detect_fnb_columns(page)
+                cols = self._detect_fnb_columns(page_words)
                 if cols is not None:
                     bank_stmt_positional = True
                     cached_columns = cols
@@ -683,7 +685,7 @@ class FNBParser(BaseBankParser):
             # ── Positional parsing for Bank Statement format ──────────
             if bank_stmt_positional and not iso_mode:
                 page_rows, previous_balance = self._extract_bank_statement_page_positional(
-                    page, page_text, cached_columns,
+                    page, page_words, page_text, cached_columns,
                     previous_balance, current_year,
                     start_month, start_year, end_month, end_year,
                 )
@@ -691,8 +693,6 @@ class FNBParser(BaseBankParser):
                 continue
 
             # ── Fallback: text-based line parsing (CR/DR & ISO) ─────────
-            page_words = page.extract_words()
-
             for line in page_text.split("\n"):
                 line = line.strip()
 

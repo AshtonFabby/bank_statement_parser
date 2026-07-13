@@ -131,8 +131,7 @@ async def _parse_pdf_bytes(
             raise HTTPException(status_code=400, detail=error_msg)
         result["error"] = error_msg
         return result
-    parser = get_parser(detection_buffer)
-    if not parser:
+    if not bank_id:
         error_msg = "Bank not recognised."
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
@@ -140,8 +139,13 @@ async def _parse_pdf_bytes(
         return result
 
     parsing_buffer = io.BytesIO(contents)
-    bank_id = parser.BANK_ID
     parser = get_parser_by_id(bank_id, parsing_buffer)
+    if not parser:
+        error_msg = "Bank not recognised."
+        if raise_on_error:
+            raise HTTPException(status_code=400, detail=error_msg)
+        result["error"] = error_msg
+        return result
 
     try:
         account_info, df = parser.parse()
@@ -344,11 +348,11 @@ async def parse_statement(
     total_count = len(files or []) + len(url_list)
     raise_on_error = total_count == 1
 
-    tasks = [
-        *[process_single_file(f, raise_on_error=raise_on_error) for f in (files or [])],
-        *[process_single_url(u, raise_on_error=raise_on_error) for u in url_list],
-    ]
-    all_results = await asyncio.gather(*tasks)
+    all_results = []
+    for f in (files or []):
+        all_results.append(await process_single_file(f, raise_on_error=raise_on_error))
+    for u in url_list:
+        all_results.append(await process_single_url(u, raise_on_error=raise_on_error))
 
     results = [r for r in all_results if not r["error"]]
     errors = [r for r in all_results if r["error"]]
@@ -456,11 +460,11 @@ async def parse_statement_json(
     total_count = len(files or []) + len(url_list)
     raise_on_error = total_count == 1
 
-    tasks = [
-        *[process_single_file(f, raise_on_error=raise_on_error) for f in (files or [])],
-        *[process_single_url(u, raise_on_error=raise_on_error) for u in url_list],
-    ]
-    all_results = await asyncio.gather(*tasks)
+    all_results = []
+    for f in (files or []):
+        all_results.append(await process_single_file(f, raise_on_error=raise_on_error))
+    for u in url_list:
+        all_results.append(await process_single_url(u, raise_on_error=raise_on_error))
 
     all_dfs = []
     errors = []
@@ -682,8 +686,9 @@ async def generate_full_prevet(
             )
 
         if url_list:
-            tasks = [process_single_url(u, raise_on_error=False) for u in url_list]
-            all_results = await asyncio.gather(*tasks)
+            all_results = []
+            for u in url_list:
+                all_results.append(await process_single_url(u, raise_on_error=False))
             results = [r for r in all_results if not r["error"]]
 
             if results:

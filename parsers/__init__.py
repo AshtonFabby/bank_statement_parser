@@ -82,19 +82,18 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
     Returns:
         Bank ID string or None if not detected
     """
-    import pdfplumber
-    from pdfplumber.utils.exceptions import PdfminerException
+    import fitz
 
     pdf_file = _unwrap_java_serialized_pdf(pdf_file)
 
     pdf_file.seek(0)
     try:
-        pdf_context = pdfplumber.open(pdf_file)
-    except PdfminerException:
+        pdf_context = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    except Exception:
         return "INVALID_PDF"
     with pdf_context as pdf:
-        if pdf.pages:
-            first_page_text = pdf.pages[0].extract_text() or ""
+        if len(pdf) > 0:
+            first_page_text = pdf[0].get_text() or ""
             # Limit to first 20 lines so transaction references to other banks
             # don't inflate scores above the actual issuing bank's branding.
             # Nedbank statements have branding on line 13 (nedbank.co.za) and

@@ -585,44 +585,21 @@ class CapitecParser(BaseBankParser):
     def _detect_format(self) -> str:
         """Detect statement format (business vs standard)."""
         first_page = self._extract_first_page_text()
-        first_page_lower = first_page.lower()
+        first_page_clean = first_page.lower().replace("\n", " ")
 
         # Check for standard format indicators first - "Money in"/"Money out"
         # columns indicate standard format even on business accounts
-        if "money in" in first_page_lower and "money out" in first_page_lower:
+        if "money in" in first_page_clean and "money out" in first_page_clean:
             return "standard"
 
         # Business format indicators
-        if "business account" in first_page_lower:
+        if "business account" in first_page_clean:
             return "business"
-        if "post date" in first_page_lower and "trans" in first_page_lower:
+        if "post date" in first_page_clean and "trans" in first_page_clean:
             return "business"
         # Check for DD/MM/YY DD/MM/YY pattern (two short dates)
         if self.BUSINESS_DATE_PATTERN.search(first_page):
             return "business"
-
-        # Also check table content for business format indicators
-        try:
-            with pdfplumber.open(self.pdf_file) as pdf:
-                if pdf.pages:
-                    tables = pdf.pages[0].extract_tables()
-                    if tables:
-                        for table in tables:
-                            for row in table:
-                                if row:
-                                    combined = " ".join(c for c in row if c).lower()
-                                    if (
-                                        "money in" in combined
-                                        and "money out" in combined
-                                    ):
-                                        self._reset_file()
-                                        return "standard"
-                                    if "post" in combined and "date" in combined:
-                                        self._reset_file()
-                                        return "business"
-            self._reset_file()
-        except Exception:
-            self._reset_file()
 
         return "standard"
 

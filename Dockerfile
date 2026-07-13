@@ -18,7 +18,7 @@ EXPOSE 8000
 
 CMD ["gunicorn", "main:app", \
     "--worker-class", "uvicorn.workers.UvicornWorker", \
-    "--workers", "2", \
+    "--workers", "1", \
     "--timeout", "300", \
     "--graceful-timeout", "30", \
     "--bind", "0.0.0.0:8000", \
