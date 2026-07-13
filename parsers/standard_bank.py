@@ -45,9 +45,9 @@ class StandardBankParser(BaseBankParser):
     # Amount pattern - handles comma-separated amounts and negative values
     AMOUNT_PATTERN = re.compile(r"-?\s*R?\s*-?[\d,]+\.\d{2}(?=\s|$)")
     # SA format amounts: comma decimal, space thousands (e.g. -432 785,10 or +41 635,00)
-    SA_AMOUNT_PATTERN = re.compile(r"[+-]?\d{1,3}(?: \d{3})*,\d{2}(?=\s|$)")
+    SA_AMOUNT_PATTERN = re.compile(r"(?<!\w)[+-]?\d{1,3}(?: \d{3})*,\d{2}(?=\s|$)")
     # SA format amounts: period decimal, space thousands (e.g. -7 936 635.59 or + 40 440.00)
-    SA_AMOUNT_PATTERN_PERIOD = re.compile(r"[+-]?\s?\d{1,3}(?: \d{3})*\.\d{2}(?=\s|$)")
+    SA_AMOUNT_PATTERN_PERIOD = re.compile(r"(?<!\w)[+-]?\s?\d{1,3}(?: \d{3})*\.\d{2}(?=\s|$)")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Standard Bank statement."""
@@ -323,7 +323,7 @@ class StandardBankParser(BaseBankParser):
                         month_num = self.MONTH_ORDER.get(month_str, 0)
                         if current_year:
                             # Year rollover: Dec -> Jan means increment year
-                            if prev_month_num and month_num and month_num < prev_month_num:
+                            if prev_month_num == 12 and month_num == 1:
                                 try:
                                     current_year = str(int(current_year) + 1)
                                 except ValueError:
