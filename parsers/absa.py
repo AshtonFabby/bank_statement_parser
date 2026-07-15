@@ -539,6 +539,11 @@ class ABSAParser(BaseBankParser):
         pending_date: str | None = None
         pending_desc: str | None = None
         pending_amount: float | None = None
+        # Main transaction row that trailing reference lines attach to.
+        # Reference lines (e.g. "Merch Cap Mca-for Advance 0695" for a Merchant
+        # Capital debit order, "Thecp ..." for a Capital Partners debit order)
+        # appear on their own line after the transaction and identify the payee.
+        last_txn_row: dict | None = None
 
         for page_text in self._iterate_pages():
             lines = page_text.split("\n")
@@ -562,12 +567,47 @@ class ABSAParser(BaseBankParser):
                     or "Absa Bank Limited" in line
                     or "DGP002SV" in line
                     or "Our Privacy Notice" in line
+                    # End-of-statement disclaimer prose (would otherwise be
+                    # appended to the preceding transaction as a "reference")
+                    or "currency conversion" in line
+                    or "through an international" in line
+                    or "applies to any transactions" in line
+                    or line == "merchant."
+                    or line.startswith("Important If")
+                    or "differ from your records" in line
+                    or "expedite any adjustments" in line
+                    or line.startswith("Authorised Financial")
+                    or line.startswith("Registration number")
                 ):
                     continue
 
                 # Check for date line
                 date_match = self.BIZSTART_DATE_PATTERN.match(line)
                 if date_match:
+                    # Flush an unresolved credit reversal ("Direct Debit Unpaid"
+                    # whose balance is not printed because it is followed only by
+                    # a pending unpaid-fee notice). Its balance is the running
+                    # balance plus the reversed (credit) amount.
+                    if (
+                        pending_date is not None
+                        and pending_amount is not None
+                        and pending_amount > 0.0
+                    ):
+                        base = rows[-1]["Balance"] if rows else 0.0
+                        rows.append(
+                            create_transaction_row(
+                                pending_date,
+                                pending_desc,
+                                0.0,
+                                pending_amount,
+                                round(base + pending_amount, 2),
+                            )
+                        )
+                        last_txn_row = rows[-1]
+                        pending_date = None
+                        pending_desc = None
+                        pending_amount = None
+
                     day = date_match.group(1)
                     month_name = date_match.group(2)
                     year = date_match.group(3)
@@ -585,6 +625,7 @@ class ABSAParser(BaseBankParser):
                                 )
                             )
                         pending_date = None
+                        last_txn_row = None
                         continue
 
                     # Find amounts in rest of line
@@ -607,6 +648,7 @@ class ABSAParser(BaseBankParser):
                                 date_str, desc, debit, credit, balance
                             )
                         )
+                        last_txn_row = rows[-1]
                         pending_date = None
                         pending_desc = None
                         pending_amount = None
@@ -629,10 +671,23 @@ class ABSAParser(BaseBankParser):
                         balance = self._parse_bizstart_amount(amounts[-1].group())
                         fee_desc = line[: amounts[0].start()].strip()
 
+                        # A fee marked "( Pending )" has NOT yet been applied to
+                        # the printed balance; it is charged later via a separate
+                        # "Transaction Fee Recovered" entry. For a normal fee the
+                        # printed balance already includes it.
+                        is_pending_fee = "( Pending )" in fee_desc
+
                         if pending_date is not None:
                             if pending_amount is not None and pending_amount != 0.0:
                                 # Main transaction + separate fee
-                                balance_before_fee = balance - fee_val
+                                if is_pending_fee:
+                                    # Printed balance is the main transaction's
+                                    # balance (fee not yet applied).
+                                    balance_before_fee = balance
+                                    fee_debit = 0.0
+                                else:
+                                    balance_before_fee = balance - fee_val
+                                    fee_debit = abs(fee_val)
                                 debit = (
                                     abs(pending_amount)
                                     if pending_amount < 0
@@ -650,27 +705,31 @@ class ABSAParser(BaseBankParser):
                                         balance_before_fee,
                                     )
                                 )
-                                # Add fee as separate row
+                                # Add fee as separate row (zero impact if pending)
                                 rows.append(
                                     create_transaction_row(
                                         pending_date,
                                         fee_desc,
-                                        abs(fee_val),
+                                        fee_debit,
                                         0.0,
-                                        balance,
+                                        balance_before_fee if is_pending_fee else balance,
                                     )
                                 )
+                                # Reference lines describe the main transaction,
+                                # not the fee row.
+                                last_txn_row = rows[-2]
                             else:
                                 # Fee-only transaction (e.g. "Proof Of Paymt Sms")
                                 rows.append(
                                     create_transaction_row(
                                         pending_date,
                                         pending_desc or fee_desc,
-                                        abs(fee_val),
+                                        0.0 if is_pending_fee else abs(fee_val),
                                         0.0,
                                         balance,
                                     )
                                 )
+                                last_txn_row = rows[-1]
                         else:
                             # Orphan fee (cross-page continuation)
                             last_date = rows[-1]["Date"] if rows else ""
@@ -678,18 +737,77 @@ class ABSAParser(BaseBankParser):
                                 create_transaction_row(
                                     last_date,
                                     fee_desc,
-                                    abs(fee_val),
+                                    0.0 if is_pending_fee else abs(fee_val),
                                     0.0,
                                     balance,
                                 )
                             )
+                            last_txn_row = rows[-1]
 
                         pending_date = None
                         pending_desc = None
                         pending_amount = None
                         continue
 
-                # Continuation line - skip (reference info, card numbers, etc.)
+                    # Pending fee notice without a balance (e.g.
+                    # "Unpaid Fee ( Pending ) 150,00-"): no balance impact now, it
+                    # is charged later via "Transaction Fee Recovered". Skip it so
+                    # it neither creates a row nor pollutes the prior description.
+                    if "( Pending )" in line:
+                        continue
+
+                    # Real fee with an amount but no printed balance (page-break
+                    # wrap, e.g. "Transaction Fee Recovered 137,01-"). Apply it as
+                    # a debit with the balance computed from the running balance.
+                    if amounts and len(amounts) == 1:
+                        fee_val = self._parse_bizstart_amount(amounts[0].group())
+                        fee_desc = line[: amounts[0].start()].strip()
+                        base = rows[-1]["Balance"] if rows else 0.0
+                        # Flush a pending main transaction first, if any.
+                        if pending_date is not None and pending_amount:
+                            main_balance = round(base + pending_amount, 2)
+                            rows.append(
+                                create_transaction_row(
+                                    pending_date,
+                                    pending_desc,
+                                    abs(pending_amount) if pending_amount < 0 else 0.0,
+                                    pending_amount if pending_amount > 0 else 0.0,
+                                    main_balance,
+                                )
+                            )
+                            base = main_balance
+                        fee_date = pending_date or (rows[-1]["Date"] if rows else "")
+                        rows.append(
+                            create_transaction_row(
+                                fee_date,
+                                fee_desc,
+                                abs(fee_val),
+                                0.0,
+                                round(base - abs(fee_val), 2),
+                            )
+                        )
+                        last_txn_row = rows[-1]
+                        pending_date = None
+                        pending_desc = None
+                        pending_amount = None
+                        continue
+
+                # Continuation line: a reference that identifies the payee of the
+                # preceding transaction (e.g. "Merch Cap Mca-for Advance 0695" ->
+                # Merchant Capital, "Thecp ..." -> Capital Partners). Append it to
+                # the main transaction's description so the facility is identifiable.
+                # Only attach when not mid-transaction (pending resolved) and the
+                # line carries actual reference text.
+                if (
+                    pending_date is None
+                    and last_txn_row is not None
+                    and re.search(r"[A-Za-z]", line)
+                ):
+                    existing = last_txn_row["Description"]
+                    if line not in existing:
+                        last_txn_row["Description"] = (
+                            f"{existing} {line}".strip() if existing else line
+                        )
 
         # Finalize any remaining pending transaction
         if pending_date is not None and pending_amount is not None and pending_amount != 0.0:
