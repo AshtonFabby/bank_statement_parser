@@ -4,7 +4,8 @@ This package provides parsers for various South African bank statements.
 """
 
 import io
-from typing import Optional, Type
+from pathlib import Path
+from typing import Optional, Type, Union
 
 from .base import AccountInfo, BaseBankParser
 from .capitec import CapitecParser
@@ -68,7 +69,7 @@ def _unwrap_java_serialized_pdf(pdf_file: io.BytesIO) -> io.BytesIO:
     return pdf_file
 
 
-def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
+def detect_bank(pdf_file: Union[str, Path, bytes, bytearray, io.BytesIO]) -> Optional[str]:
     """Detect which bank the statement is from.
 
     Uses a scoring system based on keyword frequency rather than first-match.
@@ -77,18 +78,25 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
     it once or twice. The parser with the highest score wins.
 
     Args:
-        pdf_file: PDF file buffer
+        pdf_file: Path to a PDF on disk, raw PDF bytes, or a file-like buffer
 
     Returns:
         Bank ID string or None if not detected
     """
     import fitz
 
-    pdf_file = _unwrap_java_serialized_pdf(pdf_file)
-
-    pdf_file.seek(0)
     try:
-        pdf_context = fitz.open(stream=pdf_file.read(), filetype="pdf")
+        if isinstance(pdf_file, (str, Path)):
+            # Zero-copy: fitz reads directly from disk (main.py has already
+            # unwrapped any Java-serialized wrapper on the temp file).
+            pdf_context = fitz.open(str(pdf_file))
+        elif isinstance(pdf_file, (bytes, bytearray)):
+            pdf_context = fitz.open(stream=pdf_file, filetype="pdf")
+        else:
+            pdf_file = _unwrap_java_serialized_pdf(pdf_file)
+            pdf_file.seek(0)
+            # fitz accepts file-like objects directly — no full read() copy.
+            pdf_context = fitz.open(stream=pdf_file, filetype="pdf")
     except Exception:
         return "INVALID_PDF"
     with pdf_context as pdf:
@@ -101,7 +109,7 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
             # Also include the last 5 lines (footer) because some FNB formats
             # only carry branding in the page footer.
             _lines = first_page_text.split("\n")
-            header_text = "\n".join(_lines[:20] + _lines[-5:])
+            header_text = "\n".join(_lines[:50] + _lines[-10:])
 
             best_parser = None
             best_score = 0
@@ -113,10 +121,12 @@ def detect_bank(pdf_file: io.BytesIO) -> Optional[str]:
                     best_parser = parser_class
 
             if best_parser is not None:
-                pdf_file.seek(0)
+                if hasattr(pdf_file, "seek"):
+                    pdf_file.seek(0)
                 return best_parser.BANK_ID
 
-    pdf_file.seek(0)
+    if hasattr(pdf_file, "seek"):
+        pdf_file.seek(0)
     return None
 
 

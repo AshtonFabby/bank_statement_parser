@@ -29,7 +29,7 @@ class NedbankParser(BaseBankParser):
     DATE_PATTERN_YMD = re.compile(r"^(\d{2})/(\d{2})/(\d{4})")  # Start of line
     # Amount patterns - comma-separated (standard) and space-separated (enquiry)
     AMOUNT_PATTERN = re.compile(r"(?<!\d)-?\d{1,3}(?:,\d{3})*\.\d{2}(?!\d)")
-    AMOUNT_PATTERN_SPACES = re.compile(r"(?<!\d)-?\d{1,3}(?: \d{3})+\.\d{2}(?!\d)")
+    AMOUNT_PATTERN_SPACES = re.compile(r"(?<![\d.])-?\d{1,3}(?: \d{3})+\.\d{2}(?!\d)")
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Nedbank statement."""
@@ -201,7 +201,7 @@ class NedbankParser(BaseBankParser):
                     last = result[-1]
                     amt_match = amt_pattern.search(last) or self.AMOUNT_PATTERN.search(last)
                     if amt_match:
-                        result[-1] = last[:amt_match.start()] + " " + stripped + last[amt_match.start():]
+                        result[-1] = last[:amt_match.start()] + " " + stripped + " " + last[amt_match.start():]
                     else:
                         result[-1] = last + " " + stripped
                 else:
@@ -258,6 +258,10 @@ class NedbankParser(BaseBankParser):
             if not line:
                 continue
             line_upper = line.upper()
+
+            # Skip VAT lines entirely
+            if "VAT" in line_upper and "= R" in line_upper:
+                continue
             if "TRANLISTNO" in line_upper or "TRAN LIST NO" in line_upper:
                 continue
             if "NARRATIVE DESCRIPTION" in line_upper or "NARRATIVEDESCRIPTION" in line_upper:

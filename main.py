@@ -5,16 +5,22 @@ Supports multiple banks with auto-detection.
 """
 
 import asyncio
+import contextlib
+import gc
 import io
 import json
 import math
+import os
 import re
+import shutil
+import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import unquote
 
+import anyio
 import certifi
 import httpx
 import pandas as pd
@@ -23,14 +29,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pypdf import PdfReader, PdfWriter
 
-from parsers import SUPPORTED_BANKS, detect_bank, get_parser, get_parser_by_id
+from parsers import SUPPORTED_BANKS, detect_bank, get_parser_by_id
 from services import (
     calculate_activity_volume,
     calculate_coverage,
     calculate_revenue,
     calculate_summary,
-    generate_prevet_pdf,
-    generate_summary_pdf,
     verify_and_correct,
 )
 
@@ -47,6 +51,55 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Resource limits — the API runs on a 1GB instance, so every ingress path is
+# size-capped and heavy work is serialized through a single semaphore slot.
+MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(30 * 1024 * 1024)))
+MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", "20"))
+MAX_JSON_UPLOAD_BYTES = int(os.getenv("MAX_JSON_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(100 * 1024 * 1024)))
+
+# Limits concurrent heavy requests (parse/report generation). Waiting requests
+# queue on the event loop at near-zero memory cost instead of each holding
+# PDFs and DataFrames simultaneously.
+_HEAVY_SEMAPHORE = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_HEAVY", "1")))
+
+
+@app.middleware("http")
+async def _reject_oversized_bodies(request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": f"Request body too large (max {MAX_BODY_BYTES // (1024 * 1024)}MB)."
+            },
+        )
+    return await call_next(request)
+
+
+def _upload_size(file: UploadFile) -> Optional[int]:
+    """Best-effort size of an UploadFile without reading it into memory."""
+    if file.size is not None:
+        return file.size
+    try:
+        file.file.seek(0, os.SEEK_END)
+        size = file.file.tell()
+        file.file.seek(0)
+        return size
+    except (OSError, AttributeError):
+        return None
+
+
+async def _read_json_upload(file: UploadFile) -> str:
+    """Read a JSON upload with a size cap."""
+    size = _upload_size(file)
+    if size is not None and size > MAX_JSON_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"JSON upload too large (max {MAX_JSON_UPLOAD_BYTES // (1024 * 1024)}MB).",
+        )
+    return (await file.read()).decode()
 
 
 @app.get("/")
@@ -72,31 +125,45 @@ def list_banks():
 _PASS_PATTERN = re.compile(r"_pass=([^_.]+)", re.IGNORECASE)
 
 
-def _unwrap_java_serialized_pdf(contents: bytes) -> bytes:
-    """If the file is a Java-serialized byte[] wrapping a PDF, extract the PDF.
+def _error_result(
+    filename: str, error: str, status_code: int = 400, bank_name: Optional[str] = None
+) -> dict:
+    return {
+        "filename": filename,
+        "bank_name": bank_name,
+        "summary": None,
+        "df": None,
+        "error": error,
+        "status_code": status_code,
+    }
+
+
+def _normalize_pdf_file(pdf_path: str, filename: str) -> str:
+    """Unwrap Java-serialized wrappers and decrypt password-protected PDFs
+    in place on the temp file. Returns the cleaned filename.
 
     Some bank portals serve statements as Java serialized objects where the
-    PDF byte stream is stored inside a byte[] array. The Java serialization
-    header is stripped and the raw PDF content is returned.
+    PDF byte stream is stored inside a byte[] array; the serialization header
+    is stripped. A `_pass=<password>` segment in the filename triggers
+    decryption via pypdf.
     """
-    if contents[:2] == b"\xac\xed":
+    with open(pdf_path, "rb") as f:
+        header = f.read(2)
+    if header == b"\xac\xed":
+        contents = Path(pdf_path).read_bytes()
         pdf_start = contents.find(b"%PDF")
         if pdf_start > 0:
-            return contents[pdf_start:]
-    return contents
+            Path(pdf_path).write_bytes(contents[pdf_start:])
+        del contents
 
-
-def _decrypt_pdf_if_needed(contents: bytes, filename: str) -> tuple[bytes, str]:
-    """If the filename contains _pass=<password>, decrypt the PDF and strip the
-    password segment from the filename. Returns (pdf_bytes, clean_filename)."""
     match = _PASS_PATTERN.search(filename)
     if not match:
-        return contents, filename
+        return filename
 
     password = match.group(1)
     clean_filename = filename[: match.start()] + filename[match.end() :]
 
-    reader = PdfReader(io.BytesIO(contents))
+    reader = PdfReader(io.BytesIO(Path(pdf_path).read_bytes()))
     if reader.is_encrypted:
         reader.decrypt(password)
 
@@ -104,66 +171,52 @@ def _decrypt_pdf_if_needed(contents: bytes, filename: str) -> tuple[bytes, str]:
     for page in reader.pages:
         writer.add_page(page)
 
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue(), clean_filename
+    with open(pdf_path, "wb") as f:
+        writer.write(f)
+    return clean_filename
 
 
-async def _parse_pdf_bytes(
-    contents: bytes, filename: str, raise_on_error: bool = True
-) -> dict:
-    """Parse raw PDF bytes and return structured result."""
-    contents = _unwrap_java_serialized_pdf(contents)
-    contents, filename = _decrypt_pdf_if_needed(contents, filename)
-    result = {
-        "filename": filename,
-        "bank_name": None,
-        "summary": None,
-        "df": None,
-        "error": None,
-    }
+def _parse_pdf_path_sync(pdf_path: str, filename: str) -> dict:
+    """Parse a PDF from disk and return a structured result.
 
-    detection_buffer = io.BytesIO(contents)
-    bank_id = detect_bank(detection_buffer)
-    if bank_id == "INVALID_PDF":
-        error_msg = "Could not be opened. The file may be corrupted or is not a valid PDF."
-        if raise_on_error:
-            raise HTTPException(status_code=400, detail=error_msg)
-        result["error"] = error_msg
-        return result
-    if not bank_id:
-        error_msg = "Bank not recognised."
-        if raise_on_error:
-            raise HTTPException(status_code=400, detail=error_msg)
-        result["error"] = error_msg
-        return result
-
-    parsing_buffer = io.BytesIO(contents)
-    parser = get_parser_by_id(bank_id, parsing_buffer)
-    if not parser:
-        error_msg = "Bank not recognised."
-        if raise_on_error:
-            raise HTTPException(status_code=400, detail=error_msg)
-        result["error"] = error_msg
-        return result
-
+    Runs in a worker thread — must not raise HTTPException; errors are
+    reported via the result dict's `error`/`status_code` fields.
+    """
     try:
-        account_info, df = parser.parse()
+        filename = _normalize_pdf_file(pdf_path, filename)
     except Exception as e:
-        error_msg = f"Failed to parse statement: {str(e)}"
-        if raise_on_error:
-            raise HTTPException(status_code=500, detail=error_msg)
-        result["error"] = error_msg
-        result["bank_name"] = parser.BANK_NAME
-        return result
+        return _error_result(filename, f"Failed to read PDF: {str(e)}")
+
+    bank_id = detect_bank(pdf_path)
+    if bank_id == "INVALID_PDF":
+        return _error_result(
+            filename,
+            "Could not be opened. The file may be corrupted or is not a valid PDF.",
+        )
+    if not bank_id:
+        return _error_result(filename, "Bank not recognised.")
+
+    with open(pdf_path, "rb") as pdf_handle:
+        parser = get_parser_by_id(bank_id, pdf_handle)
+        if not parser:
+            return _error_result(filename, "Bank not recognised.")
+
+        try:
+            account_info, df = parser.parse()
+        except Exception as e:
+            return _error_result(
+                filename,
+                f"Failed to parse statement: {str(e)}",
+                status_code=500,
+                bank_name=parser.BANK_NAME,
+            )
+        finally:
+            del parser
 
     if df.empty:
-        error_msg = "No transactions detected."
-        if raise_on_error:
-            raise HTTPException(status_code=400, detail=error_msg)
-        result["error"] = error_msg
-        result["bank_name"] = account_info.bank
-        return result
+        return _error_result(
+            filename, "No transactions detected.", bank_name=account_info.bank
+        )
 
     summary = calculate_summary(df)
 
@@ -178,22 +231,48 @@ async def _parse_pdf_bytes(
     }
 
 
+async def _parse_pdf_file(
+    pdf_path: str, filename: str, raise_on_error: bool = True
+) -> dict:
+    """Run the blocking parse in a worker thread so the event loop stays free."""
+    result = await anyio.to_thread.run_sync(_parse_pdf_path_sync, pdf_path, filename)
+    if result["error"] and raise_on_error:
+        raise HTTPException(
+            status_code=result.get("status_code", 400), detail=result["error"]
+        )
+    return result
+
+
 async def process_single_file(file: UploadFile, raise_on_error: bool = True) -> dict:
-    """Process a single PDF upload and return parsed data."""
+    """Process a single PDF upload and return parsed data.
+
+    The upload is copied to a temp file and parsed from disk so the PDF bytes
+    never need to be held in memory.
+    """
     if not file.filename.lower().endswith(".pdf"):
         error_msg = "Only PDF files are accepted."
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
-        return {
-            "filename": file.filename,
-            "bank_name": None,
-            "summary": None,
-            "df": None,
-            "error": error_msg,
-        }
+        return _error_result(file.filename, error_msg)
 
-    contents = await file.read()
-    return await _parse_pdf_bytes(contents, file.filename, raise_on_error)
+    size = _upload_size(file)
+    if size is not None and size > MAX_PDF_BYTES:
+        error_msg = f"File too large (max {MAX_PDF_BYTES // (1024 * 1024)}MB)."
+        if raise_on_error:
+            raise HTTPException(status_code=413, detail=error_msg)
+        return _error_result(file.filename, error_msg, status_code=413)
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+            await file.seek(0)
+            await anyio.to_thread.run_sync(shutil.copyfileobj, file.file, tmp)
+        return await _parse_pdf_file(tmp_path, file.filename, raise_on_error)
+    finally:
+        if tmp_path:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
 
 
 def _sanitize_for_json(obj):
@@ -210,11 +289,13 @@ def _sanitize_for_json(obj):
 def _standardize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Standardize a transaction DataFrame so Excel and PDF use identical clean data.
 
+    Takes ownership of `df` and may mutate it — callers must pass a frame they
+    no longer need (all current call sites pass freshly-built frames).
+
     - Coerces Debit/Credit/Balance to numeric (invalid → 0.0)
     - Parses Date with dayfirst=True, drops rows with unparseable dates
     - Re-formats Date back to DD/MM/YYYY strings for consistent downstream use
     """
-    df = df.copy()
     for col in ("Debit", "Credit", "Balance"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
@@ -225,7 +306,7 @@ def _standardize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         parsed = parsed[parsed.notna()]
         df["_parsed_date"] = parsed
         df["Date"] = parsed.dt.strftime("%d/%m/%Y")
-        df = df.sort_values("_parsed_date").reset_index(drop=True)
+        df = df.sort_values("_parsed_date", kind="stable").reset_index(drop=True)
         df = df.drop(columns=["_parsed_date"])
 
     return df
@@ -285,39 +366,151 @@ def _deduplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
 
 
 async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
-    """Download a PDF from a URL and return parsed data."""
+    """Download a PDF from a URL (streamed to disk, size-capped) and parse it."""
     filename = unquote(url.split("/")[-1].split("?")[0])
     if not filename.lower().endswith(".pdf"):
         filename = filename + ".pdf"
 
+    def _too_large(detail: str) -> dict:
+        if raise_on_error:
+            raise HTTPException(status_code=413, detail=detail)
+        return _error_result(filename, detail, status_code=413)
+
+    tmp_path = None
     try:
-        async with httpx.AsyncClient(timeout=120.0, verify=certifi.where()) as client:
-            response = await client.get(url)
+        with tempfile.NamedTemporaryFile(
+            suffix=".pdf", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+            async with httpx.AsyncClient(
+                timeout=120.0, verify=certifi.where()
+            ) as client:
+                async with client.stream("GET", url) as response:
+                    if response.status_code != 200:
+                        error_msg = (
+                            f"Failed to download file: HTTP {response.status_code}"
+                        )
+                        if raise_on_error:
+                            raise HTTPException(status_code=400, detail=error_msg)
+                        return _error_result(filename, error_msg)
+
+                    content_length = response.headers.get("content-length")
+                    if content_length and content_length.isdigit():
+                        if int(content_length) > MAX_PDF_BYTES:
+                            return _too_large(
+                                f"File too large (max {MAX_PDF_BYTES // (1024 * 1024)}MB)."
+                            )
+
+                    received = 0
+                    async for chunk in response.aiter_bytes():
+                        received += len(chunk)
+                        if received > MAX_PDF_BYTES:
+                            return _too_large(
+                                f"File too large (max {MAX_PDF_BYTES // (1024 * 1024)}MB)."
+                            )
+                        tmp.write(chunk)
+
+        return await _parse_pdf_file(tmp_path, filename, raise_on_error)
     except httpx.RequestError as e:
         error_msg = f"Failed to download file: {str(e)}"
         if raise_on_error:
             raise HTTPException(status_code=400, detail=error_msg)
-        return {
-            "filename": filename,
-            "bank_name": None,
-            "summary": None,
-            "df": None,
-            "error": error_msg,
-        }
+        return _error_result(filename, error_msg)
+    finally:
+        if tmp_path:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
 
-    if response.status_code != 200:
-        error_msg = f"Failed to download file: HTTP {response.status_code}"
-        if raise_on_error:
-            raise HTTPException(status_code=400, detail=error_msg)
-        return {
-            "filename": filename,
-            "bank_name": None,
-            "summary": None,
-            "df": None,
-            "error": error_msg,
-        }
 
-    return await _parse_pdf_bytes(response.content, filename, raise_on_error)
+def _parse_links_field(links: Optional[str]) -> List[str]:
+    """Parse and validate the `links` form field into a list of URLs."""
+    if not links:
+        return []
+    try:
+        url_list = json.loads(links)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400, detail="'links' must be a valid JSON array of URLs."
+        )
+    if not isinstance(url_list, list):
+        raise HTTPException(
+            status_code=400, detail="'links' must be a valid JSON array of URLs."
+        )
+    return url_list
+
+
+def _check_file_count(total_count: int) -> None:
+    if total_count > MAX_FILES_PER_REQUEST:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Too many files (max {MAX_FILES_PER_REQUEST} per request).",
+        )
+
+
+def _build_parse_zip_sync(results: list, errors: list, timestamp: str) -> io.BytesIO:
+    """Assemble the combined Excel + summary PDF ZIP. Runs in a worker thread."""
+    from services import generate_summary_pdf  # lazy: pulls in reportlab
+
+    zip_buffer = io.BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        all_dfs = []
+        verification_results = []
+        for result in results:
+            corrected_df, vr = verify_and_correct(
+                result["df"],
+                filename=result["filename"],
+                bank_name=result["bank_name"],
+                bank_id=result.get("bank_id", ""),
+                account_number=result.get("account_number"),
+            )
+            result["df"] = None
+            verification_results.append(vr)
+            corrected_df["Source"] = result["bank_name"]
+            all_dfs.append(corrected_df)
+
+            v_filename = Path(result["filename"]).stem + ".verification.json"
+            zip_file.writestr(
+                v_filename, json.dumps(vr.to_dict(), indent=2, default=str)
+            )
+
+        combined_df = _standardize_dataframe(
+            _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
+        )
+        del all_dfs
+
+        combined_excel_buffer = io.BytesIO()
+        combined_df.to_excel(combined_excel_buffer, index=False, engine="xlsxwriter")
+        zip_file.writestr(
+            f"combined_parsed_{timestamp}.xlsx", combined_excel_buffer.getvalue()
+        )
+        del combined_excel_buffer
+
+        combined_summary = calculate_summary(combined_df)
+        combined_coverage = calculate_coverage(combined_df)
+        combined_activity = calculate_activity_volume(combined_df)
+        combined_revenue = calculate_revenue(combined_df)
+        combined_pdf_buffer = generate_summary_pdf(
+            combined_df,
+            combined_summary,
+            combined_coverage,
+            combined_activity,
+            combined_revenue,
+            verification_results=verification_results,
+        )
+        zip_file.writestr(
+            f"combined_summary_{timestamp}.pdf", combined_pdf_buffer.getvalue()
+        )
+        del combined_pdf_buffer
+
+        if errors:
+            error_report = "Files that could not be parsed:\n\n"
+            for e in errors:
+                error_report += f"- {e['filename']}: {e['error']}\n"
+            zip_file.writestr("parsing_errors.txt", error_report)
+
+    zip_buffer.seek(0)
+    return zip_buffer
 
 
 @app.post("/parse")
@@ -336,92 +529,42 @@ async def parse_statement(
             status_code=400, detail="Provide either 'files' or 'links'."
         )
 
-    url_list: List[str] = []
-    if links:
-        try:
-            url_list = json.loads(links)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400, detail="'links' must be a valid JSON array of URLs."
-            )
-
+    url_list = _parse_links_field(links)
     total_count = len(files or []) + len(url_list)
+    _check_file_count(total_count)
     raise_on_error = total_count == 1
 
-    all_results = []
-    for f in (files or []):
-        all_results.append(await process_single_file(f, raise_on_error=raise_on_error))
-    for u in url_list:
-        all_results.append(await process_single_url(u, raise_on_error=raise_on_error))
+    async with _HEAVY_SEMAPHORE:
+        try:
+            all_results = []
+            for f in (files or []):
+                all_results.append(
+                    await process_single_file(f, raise_on_error=raise_on_error)
+                )
+            for u in url_list:
+                all_results.append(
+                    await process_single_url(u, raise_on_error=raise_on_error)
+                )
 
-    results = [r for r in all_results if not r["error"]]
-    errors = [r for r in all_results if r["error"]]
+            results = [r for r in all_results if not r["error"]]
+            errors = [r for r in all_results if r["error"]]
 
-    if not results:
-        error_details = "; ".join([f"{e['filename']}: {e['error']}" for e in errors])
-        raise HTTPException(
-            status_code=400,
-            detail=f"No transactions could be extracted from any file. Errors: {error_details}",
-        )
+            if not results:
+                error_details = "; ".join(
+                    [f"{e['filename']}: {e['error']}" for e in errors]
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No transactions could be extracted from any file. Errors: {error_details}",
+                )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_buffer = io.BytesIO()
-
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        all_dfs = []
-        verification_results = []
-        for result in results:
-            corrected_df, vr = verify_and_correct(
-                result["df"],
-                filename=result["filename"],
-                bank_name=result["bank_name"],
-                bank_id=result.get("bank_id", ""),
-                account_number=result.get("account_number"),
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_buffer = await anyio.to_thread.run_sync(
+                _build_parse_zip_sync, results, errors, timestamp
             )
-            verification_results.append(vr)
-            result["df"] = corrected_df
-            df_with_source = corrected_df.copy()
-            df_with_source["Source"] = result["bank_name"]
-            all_dfs.append(df_with_source)
-
-            v_filename = Path(result["filename"]).stem + ".verification.json"
-            zip_file.writestr(
-                v_filename, json.dumps(vr.to_dict(), indent=2, default=str)
-            )
-
-        combined_df = _standardize_dataframe(
-            _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
-        )
-
-        combined_excel_buffer = io.BytesIO()
-        combined_df.to_excel(combined_excel_buffer, index=False, engine="openpyxl")
-        zip_file.writestr(
-            f"combined_parsed_{timestamp}.xlsx", combined_excel_buffer.getvalue()
-        )
-
-        combined_summary = calculate_summary(combined_df)
-        combined_coverage = calculate_coverage(combined_df)
-        combined_activity = calculate_activity_volume(combined_df)
-        combined_revenue = calculate_revenue(combined_df)
-        combined_pdf_buffer = generate_summary_pdf(
-            combined_df,
-            combined_summary,
-            combined_coverage,
-            combined_activity,
-            combined_revenue,
-            verification_results=verification_results,
-        )
-        zip_file.writestr(
-            f"combined_summary_{timestamp}.pdf", combined_pdf_buffer.getvalue()
-        )
-
-        if errors:
-            error_report = "Files that could not be parsed:\n\n"
-            for e in errors:
-                error_report += f"- {e['filename']}: {e['error']}\n"
-            zip_file.writestr("parsing_errors.txt", error_report)
-
-    zip_buffer.seek(0)
+            del all_results, results
+        finally:
+            gc.collect()
 
     return StreamingResponse(
         zip_buffer,
@@ -448,24 +591,35 @@ async def parse_statement_json(
             status_code=400, detail="Provide either 'files' or 'links'."
         )
 
-    url_list: List[str] = []
-    if links:
-        try:
-            url_list = json.loads(links)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400, detail="'links' must be a valid JSON array of URLs."
-            )
-
+    url_list = _parse_links_field(links)
     total_count = len(files or []) + len(url_list)
+    _check_file_count(total_count)
     raise_on_error = total_count == 1
 
-    all_results = []
-    for f in (files or []):
-        all_results.append(await process_single_file(f, raise_on_error=raise_on_error))
-    for u in url_list:
-        all_results.append(await process_single_url(u, raise_on_error=raise_on_error))
+    async with _HEAVY_SEMAPHORE:
+        try:
+            all_results = []
+            for f in (files or []):
+                all_results.append(
+                    await process_single_file(f, raise_on_error=raise_on_error)
+                )
+            for u in url_list:
+                all_results.append(
+                    await process_single_url(u, raise_on_error=raise_on_error)
+                )
 
+            response = await anyio.to_thread.run_sync(
+                _build_parse_json_sync, all_results, total_count
+            )
+            del all_results
+        finally:
+            gc.collect()
+
+    return JSONResponse(content=response)
+
+
+def _build_parse_json_sync(all_results: list, total_count: int) -> dict:
+    """Verify, combine, and serialize parse results. Runs in a worker thread."""
     all_dfs = []
     errors = []
     verification_results = []
@@ -484,11 +638,10 @@ async def parse_statement_json(
                 bank_id=result.get("bank_id", ""),
                 account_number=result.get("account_number"),
             )
-            result["df"] = corrected_df
+            result["df"] = None
             verification_results.append(vr.to_dict())
-            df_with_source = corrected_df.copy()
-            df_with_source["Source"] = result["bank_name"]
-            all_dfs.append(df_with_source)
+            corrected_df["Source"] = result["bank_name"]
+            all_dfs.append(corrected_df)
 
     if not all_dfs:
         error_details = "; ".join([f"{e['filename']}: {e['error']}" for e in errors])
@@ -497,9 +650,11 @@ async def parse_statement_json(
             detail=f"No transactions could be extracted from any file. Errors: {error_details}",
         )
 
+    successful_files = len(all_dfs)
     combined_df = _standardize_dataframe(
         _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
     )
+    del all_dfs
     combined_summary = calculate_summary(combined_df)
     coverage = calculate_coverage(combined_df)
     activity = calculate_activity_volume(combined_df)
@@ -513,13 +668,13 @@ async def parse_statement_json(
         "transactions": combined_df.to_dict(orient="records"),
         "verification": verification_results,
         "document_count": total_count,
-        "successful_files": len(all_dfs),
+        "successful_files": successful_files,
     }
 
     if errors:
         response["parsing_errors"] = errors
 
-    return JSONResponse(content=_sanitize_for_json(response))
+    return _sanitize_for_json(response)
 
 
 def _build_report_from_transactions(transactions: list) -> tuple:
@@ -531,6 +686,50 @@ def _build_report_from_transactions(transactions: list) -> tuple:
     activity = calculate_activity_volume(combined_df)
     revenue = calculate_revenue(combined_df)
     return combined_df, summary, coverage, activity, revenue
+
+
+def _build_analysis_from_records(records: list):
+    """Standardize, verify, and analyze transaction records. Runs in a worker thread.
+
+    Returns (combined_df, summary, coverage, activity, revenue, verification_results).
+    """
+    combined_df, summary, coverage, activity, revenue = _build_report_from_transactions(
+        records
+    )
+    corrected_df, verification_results = _verify_grouped_results(combined_df)
+    if corrected_df is not None:
+        combined_df = corrected_df
+        summary = calculate_summary(combined_df)
+        coverage = calculate_coverage(combined_df)
+        activity = calculate_activity_volume(combined_df)
+        revenue = calculate_revenue(combined_df)
+    return combined_df, summary, coverage, activity, revenue, verification_results
+
+
+def _build_report_zip_sync(records: list, timestamp: str) -> io.BytesIO:
+    """Assemble the /report ZIP (Excel + summary PDF). Runs in a worker thread."""
+    from services import generate_summary_pdf  # lazy: pulls in reportlab
+
+    combined_df, summary, coverage, activity, revenue, verification_results = (
+        _build_analysis_from_records(records)
+    )
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        excel_buffer = io.BytesIO()
+        combined_df.to_excel(excel_buffer, index=False, engine="xlsxwriter")
+        zip_file.writestr(f"combined_parsed_{timestamp}.xlsx", excel_buffer.getvalue())
+        del excel_buffer
+
+        pdf_buffer = generate_summary_pdf(
+            combined_df, summary, coverage, activity, revenue,
+            verification_results=verification_results,
+        )
+        zip_file.writestr(f"combined_summary_{timestamp}.pdf", pdf_buffer.getvalue())
+        del pdf_buffer
+
+    zip_buffer.seek(0)
+    return zip_buffer
 
 
 @app.post("/report")
@@ -547,7 +746,7 @@ async def generate_report(
     """
     raw = None
     if transactions_file:
-        raw = (await transactions_file.read()).decode()
+        raw = await _read_json_upload(transactions_file)
     elif transactions:
         raw = transactions
 
@@ -566,33 +765,16 @@ async def generate_report(
     if not records:
         raise HTTPException(status_code=400, detail="No transactions provided.")
 
-    combined_df, summary, coverage, activity, revenue = _build_report_from_transactions(
-        records
-    )
-
-    corrected_df, verification_results = _verify_grouped_results(combined_df)
-    if corrected_df is not None:
-        combined_df = corrected_df
-        summary = calculate_summary(combined_df)
-        coverage = calculate_coverage(combined_df)
-        activity = calculate_activity_volume(combined_df)
-        revenue = calculate_revenue(combined_df)
-
+    del raw
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_buffer = io.BytesIO()
 
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        excel_buffer = io.BytesIO()
-        combined_df.to_excel(excel_buffer, index=False, engine="openpyxl")
-        zip_file.writestr(f"combined_parsed_{timestamp}.xlsx", excel_buffer.getvalue())
-
-        pdf_buffer = generate_summary_pdf(
-            combined_df, summary, coverage, activity, revenue,
-            verification_results=verification_results,
-        )
-        zip_file.writestr(f"combined_summary_{timestamp}.pdf", pdf_buffer.getvalue())
-
-    zip_buffer.seek(0)
+    async with _HEAVY_SEMAPHORE:
+        try:
+            zip_buffer = await anyio.to_thread.run_sync(
+                _build_report_zip_sync, records, timestamp
+            )
+        finally:
+            gc.collect()
 
     return StreamingResponse(
         zip_buffer,
@@ -601,6 +783,87 @@ async def generate_report(
             "Content-Disposition": f"attachment; filename=combined_statements_{timestamp}.zip"
         },
     )
+
+
+def _build_full_prevet_sync(
+    form_data: dict, records: Optional[list], parsed_results: Optional[list]
+) -> io.BytesIO:
+    """Build the merged PreVet + bank analysis PDF. Runs in a worker thread."""
+    from services import generate_prevet_pdf, generate_summary_pdf  # lazy: reportlab
+
+    # ── 1. Generate PreVet PDF locally ────────────────────────────────────
+    prevet_buffer = generate_prevet_pdf(form_data)
+
+    # ── 2. Generate Bank Analysis PDF ─────────────────────────────────────
+    bank_pdf_buffer: Optional[io.BytesIO] = None
+
+    if records:
+        # Fast path: use pre-parsed transactions
+        combined_df, summary, coverage, activity, revenue, verification_results = (
+            _build_analysis_from_records(records)
+        )
+        bank_pdf_buffer = generate_summary_pdf(
+            combined_df, summary, coverage, activity, revenue,
+            verification_results=verification_results,
+        )
+        del combined_df
+
+    elif parsed_results:
+        results = [r for r in parsed_results if not r["error"]]
+        if results:
+            all_dfs = []
+            verification_results = []
+            for result in results:
+                corrected_df, vr = verify_and_correct(
+                    result["df"],
+                    filename=result["filename"],
+                    bank_name=result["bank_name"],
+                    bank_id=result.get("bank_id", ""),
+                    account_number=result.get("account_number"),
+                )
+                result["df"] = None
+                verification_results.append(vr)
+                corrected_df["Source"] = result["bank_name"]
+                all_dfs.append(corrected_df)
+
+            combined_df = _standardize_dataframe(
+                _deduplicate_transactions(
+                    pd.concat(all_dfs, ignore_index=True)
+                )
+            )
+            del all_dfs
+            combined_summary = calculate_summary(combined_df)
+            combined_coverage = calculate_coverage(combined_df)
+            combined_activity = calculate_activity_volume(combined_df)
+            combined_revenue = calculate_revenue(combined_df)
+            bank_pdf_buffer = generate_summary_pdf(
+                combined_df,
+                combined_summary,
+                combined_coverage,
+                combined_activity,
+                combined_revenue,
+                verification_results=verification_results,
+            )
+            del combined_df
+
+    # ── 3. Merge PDFs ─────────────────────────────────────────────────────
+    writer = PdfWriter()
+
+    prevet_buffer.seek(0)
+    prevet_reader = PdfReader(prevet_buffer)
+    for page in prevet_reader.pages:
+        writer.add_page(page)
+
+    if bank_pdf_buffer is not None:
+        bank_pdf_buffer.seek(0)
+        bank_reader = PdfReader(bank_pdf_buffer)
+        for page in bank_reader.pages:
+            writer.add_page(page)
+
+    output_buffer = io.BytesIO()
+    writer.write(output_buffer)
+    output_buffer.seek(0)
+    return output_buffer
 
 
 @app.post("/generate-full-prevet")
@@ -623,7 +886,7 @@ async def generate_full_prevet(
     # Resolve prevet_data from file or form field
     raw_prevet = None
     if prevet_data_file:
-        raw_prevet = (await prevet_data_file.read()).decode()
+        raw_prevet = await _read_json_upload(prevet_data_file)
     elif prevet_data:
         raw_prevet = prevet_data
 
@@ -640,108 +903,39 @@ async def generate_full_prevet(
     # Resolve transactions from file or form field
     raw_transactions = None
     if transactions_file:
-        raw_transactions = (await transactions_file.read()).decode()
+        raw_transactions = await _read_json_upload(transactions_file)
     elif transactions:
         raw_transactions = transactions
 
-    # ── 1. Generate PreVet PDF locally ────────────────────────────────────
-    prevet_buffer = generate_prevet_pdf(form_data)
-    prevet_pdf_bytes = prevet_buffer.getvalue()
-
-    # ── 2. Generate Bank Analysis PDF ─────────────────────────────────────
-    bank_analysis_pdf_bytes: Optional[bytes] = None
-
+    records = None
     if raw_transactions:
-        # Fast path: use pre-parsed transactions
         try:
             records = json.loads(raw_transactions)
         except json.JSONDecodeError:
             raise HTTPException(
                 status_code=400, detail="'transactions' must be valid JSON."
             )
-        if records:
-            combined_df, summary, coverage, activity, revenue = (
-                _build_report_from_transactions(records)
-            )
-            corrected_df, verification_results = _verify_grouped_results(combined_df)
-            if corrected_df is not None:
-                combined_df = corrected_df
-                summary = calculate_summary(combined_df)
-                coverage = calculate_coverage(combined_df)
-                activity = calculate_activity_volume(combined_df)
-                revenue = calculate_revenue(combined_df)
-            bank_pdf_buffer = generate_summary_pdf(
-                combined_df, summary, coverage, activity, revenue,
-                verification_results=verification_results,
-            )
-            bank_analysis_pdf_bytes = bank_pdf_buffer.getvalue()
+        del raw_transactions
 
-    elif links:
-        # Slow path: download & parse PDFs (kept for backwards compatibility)
+    async with _HEAVY_SEMAPHORE:
         try:
-            url_list = json.loads(links)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400, detail="'links' must be a valid JSON array of URLs."
+            parsed_results = None
+            if not records and links:
+                # Slow path: download & parse PDFs (kept for backwards compatibility)
+                url_list = _parse_links_field(links)
+                _check_file_count(len(url_list))
+                parsed_results = []
+                for u in url_list:
+                    parsed_results.append(
+                        await process_single_url(u, raise_on_error=False)
+                    )
+
+            output_buffer = await anyio.to_thread.run_sync(
+                _build_full_prevet_sync, form_data, records, parsed_results
             )
-
-        if url_list:
-            all_results = []
-            for u in url_list:
-                all_results.append(await process_single_url(u, raise_on_error=False))
-            results = [r for r in all_results if not r["error"]]
-
-            if results:
-                all_dfs = []
-                verification_results = []
-                for result in results:
-                    corrected_df, vr = verify_and_correct(
-                        result["df"],
-                        filename=result["filename"],
-                        bank_name=result["bank_name"],
-                        bank_id=result.get("bank_id", ""),
-                        account_number=result.get("account_number"),
-                    )
-                    verification_results.append(vr)
-                    result["df"] = corrected_df
-                    df_with_source = corrected_df.copy()
-                    df_with_source["Source"] = result["bank_name"]
-                    all_dfs.append(df_with_source)
-
-                combined_df = _standardize_dataframe(
-                    _deduplicate_transactions(
-                        pd.concat(all_dfs, ignore_index=True)
-                    )
-                )
-                combined_summary = calculate_summary(combined_df)
-                combined_coverage = calculate_coverage(combined_df)
-                combined_activity = calculate_activity_volume(combined_df)
-                combined_revenue = calculate_revenue(combined_df)
-                bank_pdf_buffer = generate_summary_pdf(
-                    combined_df,
-                    combined_summary,
-                    combined_coverage,
-                    combined_activity,
-                    combined_revenue,
-                    verification_results=verification_results,
-                )
-                bank_analysis_pdf_bytes = bank_pdf_buffer.getvalue()
-
-    # ── 3. Merge PDFs ─────────────────────────────────────────────────────
-    writer = PdfWriter()
-
-    prevet_reader = PdfReader(io.BytesIO(prevet_pdf_bytes))
-    for page in prevet_reader.pages:
-        writer.add_page(page)
-
-    if bank_analysis_pdf_bytes:
-        bank_reader = PdfReader(io.BytesIO(bank_analysis_pdf_bytes))
-        for page in bank_reader.pages:
-            writer.add_page(page)
-
-    output_buffer = io.BytesIO()
-    writer.write(output_buffer)
-    output_buffer.seek(0)
+            del records, parsed_results
+        finally:
+            gc.collect()
 
     return StreamingResponse(
         output_buffer,

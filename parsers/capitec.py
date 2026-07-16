@@ -14,7 +14,14 @@ class CapitecParser(BaseBankParser):
 
     BANK_NAME = "Capitec"
     BANK_ID = "capitec"
-    DETECTION_KEYWORDS = [("capitec", 1)]
+    DETECTION_KEYWORDS = [
+        ("capitec", 10),
+        ("capitec bank", 15),
+        ("capitecbank.co.za", 15),
+        ("FSP46669", 15),
+        ("NCRCP13", 15),
+        ("4680173723", 15)
+    ]
 
     # Capitec-specific amount pattern: -1 234.56 or +1 234.56 or 1 234.56
     # Also handles fees with one decimal place like -6.0 or -6.00

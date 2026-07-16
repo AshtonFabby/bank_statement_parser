@@ -38,58 +38,45 @@ class BaseBankParser(ABC):
 
     def __init__(self, pdf_file: io.BytesIO):
         self.pdf_file = pdf_file
-        self._first_page_text_cache: Optional[str] = None
-        self._full_text_cache: Optional[str] = None
+        self._page_texts_cache: Optional[list[str]] = None
         self._reset_file()
 
     def _reset_file(self) -> None:
         """Reset file pointer to beginning."""
         self.pdf_file.seek(0)
 
+    def _get_page_texts(self) -> list[str]:
+        """Extract text for every page in a single pdfplumber pass and cache it.
+
+        Parsers call _iterate_pages/_extract_full_text/_extract_first_page_text
+        multiple times per parse; caching the page texts means the PDF is only
+        opened and text-extracted once instead of once per call.
+        """
+        if self._page_texts_cache is None:
+            import pdfplumber
+            texts = []
+            with pdfplumber.open(self.pdf_file) as pdf:
+                for page in pdf.pages:
+                    texts.append(page.extract_text() or "")
+                    page.flush_cache()
+            self._reset_file()
+            self._page_texts_cache = texts
+        return self._page_texts_cache
+
     def _extract_full_text(self) -> str:
         """Extract all text from the PDF."""
-        if self._full_text_cache is not None:
-            return self._full_text_cache
-
-        import pdfplumber
-        full_text = ""
-        with pdfplumber.open(self.pdf_file) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
-                page.flush_cache()
-        self._reset_file()
-        self._full_text_cache = full_text
-        return full_text
+        return "".join(
+            text + "\n" for text in self._get_page_texts() if text
+        )
 
     def _extract_first_page_text(self) -> str:
         """Extract text from the first page of the PDF."""
-        if self._first_page_text_cache is not None:
-            return self._first_page_text_cache
-
-        import pdfplumber
-        with pdfplumber.open(self.pdf_file) as pdf:
-            if pdf.pages:
-                page = pdf.pages[0]
-                text = page.extract_text() or ""
-                page.flush_cache()
-                self._reset_file()
-                self._first_page_text_cache = text
-                return text
-        self._reset_file()
-        return ""
+        texts = self._get_page_texts()
+        return texts[0] if texts else ""
 
     def _iterate_pages(self):
         """Yield text content page by page."""
-        import pdfplumber
-        with pdfplumber.open(self.pdf_file) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    yield text
-                page.flush_cache()
-        self._reset_file()
+        yield from (text for text in self._get_page_texts() if text)
 
     def _iterate_pages_with_objects(self):
         """Generator to iterate through PDF pages, yielding (text, page) tuples.

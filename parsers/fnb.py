@@ -1,6 +1,7 @@
 """FNB (First National Bank) statement parser."""
 
 import logging
+import os
 import re
 from datetime import datetime
 
@@ -31,7 +32,15 @@ class FNBParser(BaseBankParser):
 
     BANK_NAME = "FNB"
     BANK_ID = "fnb"
-    DETECTION_KEYWORDS = [("fnb", 2), ("first national bank", 5), ("fnb.co.za", 10)]
+    DETECTION_KEYWORDS = [
+        ("fnb", 2),
+        ("first national bank", 5),
+        ("fnb.co.za", 10),
+        ("4210102051", 15),
+        ("Universal Branch Code 250655", 15),
+        ("Universal Branch Code", 5),
+        ("XSTZFN0", 15)
+    ]
 
     # Transaction History format: DD MMM YYYY (e.g., "08 Jan 2026")
     # Supports both English and Afrikaans month names (full and short forms)
@@ -254,8 +263,14 @@ class FNBParser(BaseBankParser):
     # Trailing pipe/dot artefacts from 1-bit image edges.
     _OCR_TRAILING_NOISE = re.compile(r"[\s|.]+$")
 
-    @staticmethod
-    def _ocr_image_description(page, line_top: float) -> str | None:
+    # Upper bound on tesseract invocations per document. Each OCR call renders a
+    # 400-DPI crop and shells out to tesseract; a pathological statement with
+    # hundreds of image-rendered fee lines would otherwise dominate memory and
+    # request latency. Past the cap the row simply keeps no description, which
+    # callers already handle.
+    _MAX_OCR_CALLS = int(os.getenv("FNB_MAX_OCR_CALLS", "60"))
+
+    def _ocr_image_description(self, page, line_top: float) -> str | None:
         """Try to OCR a description image at the given y-position.
 
         FNB renders certain fee descriptions (e.g. #Excess Item Fee) as
@@ -266,6 +281,10 @@ class FNBParser(BaseBankParser):
         Returns the OCR'd text or None.
         """
         if not _OCR_AVAILABLE:
+            return None
+
+        ocr_calls = getattr(self, "_ocr_calls", 0)
+        if ocr_calls >= self._MAX_OCR_CALLS:
             return None
 
         from PIL import ImageOps  # deferred – only needed here
@@ -295,6 +314,8 @@ class FNBParser(BaseBankParser):
                 # Convert to grayscale and add white border to help tesseract
                 gray = pil_img.convert("L")
                 bordered = ImageOps.expand(gray, border=30, fill=255)
+                ocr_calls += 1
+                self._ocr_calls = ocr_calls
                 raw = pytesseract.image_to_string(
                     bordered, config="--psm 7"
                 ).strip()
