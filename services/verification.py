@@ -164,10 +164,18 @@ def verify_and_correct(
                     passed = True
                     corrections += 1
 
-        # Always write corrected values
+        # Always write corrected values for debit/credit (in case they were swapped)
         corrected.at[idx, "Debit"] = debit
         corrected.at[idx, "Credit"] = credit
-        corrected.at[idx, "Balance"] = corrected_balance
+
+        old_previous_corrected = previous_corrected
+
+        if passed:
+            corrected.at[idx, "Balance"] = corrected_balance
+            previous_corrected = corrected_balance
+        else:
+            corrected.at[idx, "Balance"] = actual_balance
+            previous_corrected = actual_balance
 
         verified_count += 1
         if passed:
@@ -183,14 +191,12 @@ def verify_and_correct(
                 "description": description,
                 "debit": debit,
                 "credit": credit,
-                "previous_balance": previous_corrected,
+                "previous_balance": old_previous_corrected,
                 "corrected_balance": corrected_balance,
                 "actual_balance": actual_balance,
                 "difference": difference,
                 "total_failure": is_total_failure,
             })
-
-        previous_corrected = corrected_balance
 
     accuracy = round((pass_count / verified_count) * 100, 2) if verified_count > 0 else None
 
