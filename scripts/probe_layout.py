@@ -1,7 +1,7 @@
 import fitz
 import pdfplumber
 
-file_path = r"bank_statements\1._Jan-4067.pdf"
+file_path = r"bank_statements\1._Jan.pdf"
 
 print("--- PyMuPDF ---")
 with fitz.open(file_path) as doc:

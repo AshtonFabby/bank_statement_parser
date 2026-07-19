@@ -661,8 +661,16 @@ class StandardBankParser(BaseBankParser):
                 first_amt_match = self.AMOUNT_PATTERN.search(body)
                 description = body[:first_amt_match.start()].strip()
 
-                # Handle BALANCE BROUGHT FORWARD - skip it as it duplicates opening balance
+                # BALANCE BROUGHT FORWARD carries the opening balance. Emit the
+                # first one as the anchor: without it verification adopts the
+                # first real transaction as its baseline and never checks it.
+                # Later occurrences are per-page continuation markers repeating
+                # the running balance, so they are skipped.
                 if "BALANCE BROUGHT FORWARD" in description.upper():
+                    if not rows:
+                        rows.append(create_transaction_row(
+                            "", "Opening Balance", 0.0, 0.0, balance
+                        ))
                     continue
 
                 # Column layout: Service Fee | Debit | Credit | (date) | Balance
@@ -706,16 +714,64 @@ class StandardBankParser(BaseBankParser):
         """
         fmt = self._detect_format()
         if fmt == "transactional_history":
-            return self._extract_transactions_history()
+            df = self._extract_transactions_history()
         elif fmt == "business_statement":
-            return self._extract_transactions_business()
+            df = self._extract_transactions_business()
         elif fmt == "business_statement_int":
-            return self._extract_transactions_business_int()
+            df = self._extract_transactions_business_int()
         elif fmt == "current_account":
-            return self._extract_transactions_current_account()
+            df = self._extract_transactions_current_account()
         elif fmt == "regular_with_fees":
-            return self._extract_transactions_regular_with_fees()
-        return self._extract_transactions_regular()
+            df = self._extract_transactions_regular_with_fees()
+        else:
+            df = self._extract_transactions_regular()
+        return self._normalise_chronological_order(df)
+
+    @staticmethod
+    def _normalise_chronological_order(df: pd.DataFrame) -> pd.DataFrame:
+        """Return transactions oldest-first, reversing newest-first exports.
+
+        Standard Bank emits the same export in both directions depending on
+        how it was generated: of eight otherwise-identical files, four run
+        newest-first. The amounts are extracted correctly either way, but the
+        running balance only reconciles forwards in time, so a newest-first
+        document scores near 0% and every downstream balance check is wrong.
+
+        Reversing (not sorting) is deliberate. Within a single day the source
+        lists transactions in reverse too, so a plain reverse restores the true
+        sequence, whereas sorting by date would shuffle same-day rows into an
+        arbitrary order and break the chain it was meant to fix.
+        """
+        if df is None or df.empty or "Date" not in df.columns:
+            return df
+
+        dates = pd.to_datetime(df["Date"], format="%d/%m/%Y", errors="coerce")
+        known = dates.dropna()
+        if len(known) < 2:
+            return df
+
+        # Compare adjacent pairs rather than just first vs last, so a single
+        # out-of-order row cannot flip an otherwise ascending document.
+        deltas = known.diff().dropna()
+        descending = int((deltas < pd.Timedelta(0)).sum())
+        ascending = int((deltas > pd.Timedelta(0)).sum())
+        if descending <= ascending:
+            return df
+
+        reversed_df = df.iloc[::-1].reset_index(drop=True)
+
+        # An Opening Balance anchor belongs at the top; reversing would strand
+        # it at the bottom where verification cannot use it as the baseline.
+        is_opening = (
+            reversed_df["Description"].astype(str).str.strip().str.lower()
+            == "opening balance"
+        )
+        if is_opening.any():
+            reversed_df = pd.concat(
+                [reversed_df[is_opening], reversed_df[~is_opening]]
+            ).reset_index(drop=True)
+
+        return reversed_df
 
     def _extract_transactions_regular(self) -> pd.DataFrame:
         """Extract transactions from regular Standard Bank statement format.

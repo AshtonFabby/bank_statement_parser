@@ -52,6 +52,19 @@ class VerificationResult:
     tolerance: float = TOLERANCE
     failures: list = field(default_factory=list)
     error: Optional[str] = None
+    # Rows the balance check could not assess because no baseline was
+    # established yet (no opening balance row, and nothing parsed before
+    # them). They are excluded from accuracy_percentage, so they must be
+    # reported rather than silently inflating it.
+    unverified_transactions: int = 0
+    # None when the statement declares no control totals; otherwise whether
+    # the parse matches every figure the bank declared about itself.
+    declared_totals_match: Optional[bool] = None
+    declared_totals_mismatches: list = field(default_factory=list)
+    # Transactions whose description could not be read (e.g. rendered as an
+    # image with no OCR available). The amounts are still correct; only the
+    # description is lost.
+    unreadable_descriptions: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -72,6 +85,10 @@ class VerificationResult:
                 f if isinstance(f, dict) else f.__dict__ for f in self.failures
             ],
             "error": self.error,
+            "unverified_transactions": self.unverified_transactions,
+            "declared_totals_match": self.declared_totals_match,
+            "declared_totals_mismatches": self.declared_totals_mismatches,
+            "unreadable_descriptions": self.unreadable_descriptions,
         }
 
 
@@ -82,12 +99,57 @@ def _is_opening_balance_row(row: pd.Series) -> bool:
     return any(kw in desc for kw in OPENING_BALANCE_KEYWORDS)
 
 
+def _check_declared_totals(df: pd.DataFrame, declared) -> list[dict]:
+    """Compare the parse against the control totals the bank declared.
+
+    This is the only check here that is independent of the transaction rows:
+    the running-balance check asks whether the rows agree with each other,
+    which a wholesale misread can satisfy. Comparing counts and sums against
+    the statement's own turnover block instead proves the parse is complete.
+
+    Runs on the corrected frame, so it also validates any debit/credit swap
+    the verifier applied. Returns a list of mismatches (empty when the parse
+    agrees with every figure the statement declares).
+    """
+    tx = df[~df.apply(_is_opening_balance_row, axis=1)]
+    credits = tx["Credit"].fillna(0).astype(float)
+    debits = tx["Debit"].fillna(0).astype(float)
+
+    # Cast out of numpy scalars: these land in verification.json and the
+    # /parse/json response, and json.dumps cannot serialize np.float64.
+    actuals = {
+        "credit_count": int((credits > 0).sum()),
+        "credit_total": round(float(credits.sum()), 2),
+        "debit_count": int((debits > 0).sum()),
+        "debit_total": round(float(debits.sum()), 2),
+        "closing_balance": (
+            round(float(tx.iloc[-1]["Balance"]), 2) if len(tx) else None
+        ),
+    }
+
+    mismatches = []
+    for field_name, actual in actuals.items():
+        expected = getattr(declared, field_name, None)
+        if expected is None or actual is None:
+            continue
+        if abs(float(expected) - float(actual)) >= TOLERANCE:
+            mismatches.append({
+                "field": field_name,
+                "declared": expected,
+                "parsed": actual,
+                "difference": round(float(actual) - float(expected), 2),
+            })
+    return mismatches
+
+
 def verify_and_correct(
     df: pd.DataFrame,
     filename: str = "",
     bank_name: str = "",
     bank_id: str = "",
     account_number: Optional[str] = None,
+    declared_totals=None,
+    unreadable_descriptions: int = 0,
 ) -> tuple[pd.DataFrame, VerificationResult]:
     """Verify transaction balances and return a corrected DataFrame.
 
@@ -101,6 +163,10 @@ def verify_and_correct(
 
     Only transactions that fail even after swap correction are included
     in the result's ``failures`` list.
+
+    When ``declared_totals`` is supplied (a parser's ``DeclaredTotals``, read
+    off the statement's own turnover block), the finished parse is also
+    cross-checked against it — an oracle independent of the rows themselves.
 
     Returns:
         Tuple of (corrected_df, VerificationResult).
@@ -116,6 +182,7 @@ def verify_and_correct(
     fail_count = 0
     total_failure_count = 0
     corrections = 0
+    unverified_count = 0
 
     for idx, row in df.iterrows():
         debit = float(row.get("Debit", 0) or 0)
@@ -133,6 +200,10 @@ def verify_and_correct(
             continue
 
         if previous_corrected is None:
+            # No baseline yet: this row becomes the anchor and is taken on
+            # trust. Counted so the caller can see accuracy_percentage did
+            # not cover it.
+            unverified_count += 1
             previous_corrected = actual_balance
             corrected.at[idx, "Balance"] = actual_balance
             continue
@@ -200,6 +271,12 @@ def verify_and_correct(
 
     accuracy = round((pass_count / verified_count) * 100, 2) if verified_count > 0 else None
 
+    declared_mismatches: list = []
+    declared_match = None
+    if declared_totals is not None and len(df):
+        declared_mismatches = _check_declared_totals(corrected, declared_totals)
+        declared_match = not declared_mismatches
+
     result = VerificationResult(
         filename=filename,
         bank_name=bank_name,
@@ -215,6 +292,10 @@ def verify_and_correct(
         accuracy_percentage=accuracy,
         tolerance=TOLERANCE,
         failures=failures,
+        unverified_transactions=unverified_count,
+        declared_totals_match=declared_match,
+        declared_totals_mismatches=declared_mismatches,
+        unreadable_descriptions=unreadable_descriptions,
     )
 
     return corrected, result

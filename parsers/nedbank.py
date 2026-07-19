@@ -283,9 +283,22 @@ class NedbankParser(BaseBankParser):
                 continue
             if "BALANCECARRIEDFORWARD" in line_upper.replace(" ", ""):
                 continue
-            if "BALANCEBROUGHTFORWARD" in line_upper.replace(" ", ""):
+            if "CARRIED FORWARD" in line_upper:
                 continue
-            if "BROUGHT FORWARD" in line_upper or "CARRIED FORWARD" in line_upper:
+            if ("BROUGHT FORWARD" in line_upper
+                    or "BALANCEBROUGHTFORWARD" in line_upper.replace(" ", "")):
+                # The Statement Enquiry export stitches together one mini
+                # statement per day, each opening with its own BROUGHT
+                # FORWARD. The first is the period's opening balance and is
+                # kept as the anchor; the rest merely restate the running
+                # balance at each day boundary, so they are skipped.
+                if not rows:
+                    amounts = self._find_amounts(line, format_type)
+                    if amounts:
+                        rows.append(create_transaction_row(
+                            "", "Opening Balance", 0.0, 0.0,
+                            self._clean_amount(amounts[-1]),
+                        ))
                 continue
             if "PROVISIONAL STATEMENT" in line_upper:
                 continue

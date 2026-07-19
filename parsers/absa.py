@@ -385,8 +385,12 @@ class ABSAParser(BaseBankParser):
         rows: list[dict] = []
         pending_transaction: dict | None = None
 
-        # Entry number + YYMMDD date pattern
-        entry_date_pattern = re.compile(r"^(\d{4,})\s+(\d{2})(\d{2})(\d{2})\s+(.*)")
+        # Entry number + YYMMDD date pattern. The entry number is normally 4+
+        # digits, but the opening BALANCE B/FORWARD line is numbered "00", so
+        # requiring four digits silently dropped the anchor and left the first
+        # transaction unverified. A 2+ digit number followed by a 6-digit date
+        # is specific enough not to over-match.
+        entry_date_pattern = re.compile(r"^(\d{2,})\s+(\d{2})(\d{2})(\d{2})\s+(.*)")
         # Standard amount pattern (e.g., -125.00, 1859290.57)
         amount_pattern = re.compile(r"-?[\d,]+\.\d{2}")
 

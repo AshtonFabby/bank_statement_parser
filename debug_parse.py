@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """Debug script to test parsing of bank statements."""
 
+import contextlib
 import io
 import sys
 from pathlib import Path
 
 # Add the parent directory to path to import parsers
 sys.path.insert(0, str(Path(__file__).parent))
+
+# This script prints ✓/❌ status markers, which a Windows console's default
+# cp1252 encoding cannot represent — without this every run dies on the first
+# result line with UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    with contextlib.suppress(AttributeError, ValueError):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from parsers import get_parser, get_parser_by_id, SUPPORTED_BANKS
 

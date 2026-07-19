@@ -203,6 +203,7 @@ def _parse_pdf_path_sync(pdf_path: str, filename: str) -> dict:
 
         try:
             account_info, df = parser.parse()
+            unreadable_descriptions = parser.unreadable_descriptions
         except Exception as e:
             return _error_result(
                 filename,
@@ -224,6 +225,8 @@ def _parse_pdf_path_sync(pdf_path: str, filename: str) -> dict:
         "bank_name": account_info.bank,
         "bank_id": bank_id,
         "account_number": account_info.account_number,
+        "declared_totals": account_info.declared_totals,
+        "unreadable_descriptions": unreadable_descriptions,
         "summary": summary,
         "df": df,
         "filename": filename,
@@ -359,10 +362,29 @@ def _deduplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
     excluded because it can differ between document types for the same transaction).
     The first occurrence is kept so bank-statement data takes precedence over
     transaction-history data when files are ordered that way.
+
+    Matching is by *occurrence*, not by value alone: a transaction repeated
+    within one document is a repeat of a real event, not a duplicate. FNB
+    statements routinely carry several identical same-day collections (e.g.
+    two R1,392.57 debits on the same date, each moving the balance), and
+    keying on values alone silently deletes the second one. Numbering each
+    row against its own document means the Nth occurrence in one document
+    only ever cancels the Nth occurrence in another.
     """
-    return df.drop_duplicates(
-        subset=["Date", "Description", "Debit", "Credit"], keep="first"
-    ).reset_index(drop=True)
+    key = ["Date", "Description", "Debit", "Credit"]
+    working = df.copy()
+
+    # Position of this row among identical rows *within its own document*.
+    # Without a Source column the input is a single document, so every row
+    # keeps its own count and nothing is dropped.
+    group = (["Source"] if "Source" in working.columns else []) + key
+    working["_occurrence"] = working.groupby(group, dropna=False).cumcount()
+
+    return (
+        working.drop_duplicates(subset=key + ["_occurrence"], keep="first")
+        .drop(columns="_occurrence")
+        .reset_index(drop=True)
+    )
 
 
 async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
@@ -463,6 +485,8 @@ def _build_parse_zip_sync(results: list, errors: list, timestamp: str) -> io.Byt
                 bank_name=result["bank_name"],
                 bank_id=result.get("bank_id", ""),
                 account_number=result.get("account_number"),
+                declared_totals=result.get("declared_totals"),
+                unreadable_descriptions=result.get("unreadable_descriptions", 0),
             )
             result["df"] = None
             verification_results.append(vr)
@@ -637,6 +661,8 @@ def _build_parse_json_sync(all_results: list, total_count: int) -> dict:
                 bank_name=result["bank_name"],
                 bank_id=result.get("bank_id", ""),
                 account_number=result.get("account_number"),
+                declared_totals=result.get("declared_totals"),
+                unreadable_descriptions=result.get("unreadable_descriptions", 0),
             )
             result["df"] = None
             verification_results.append(vr.to_dict())
@@ -651,9 +677,15 @@ def _build_parse_json_sync(all_results: list, total_count: int) -> dict:
         )
 
     successful_files = len(all_dfs)
-    combined_df = _standardize_dataframe(
-        _deduplicate_transactions(pd.concat(all_dfs, ignore_index=True))
-    )
+    parsed_df = pd.concat(all_dfs, ignore_index=True)
+    deduplicated_df = _deduplicate_transactions(parsed_df)
+    # Per-file verification runs before this point, so on its own it cannot
+    # see rows removed here. Report the count: with one document, or several
+    # that do not overlap, anything above zero means real transactions left
+    # the response after they were verified.
+    duplicates_removed = len(parsed_df) - len(deduplicated_df)
+    del parsed_df
+    combined_df = _standardize_dataframe(deduplicated_df)
     del all_dfs
     combined_summary = calculate_summary(combined_df)
     coverage = calculate_coverage(combined_df)
@@ -669,6 +701,7 @@ def _build_parse_json_sync(all_results: list, total_count: int) -> dict:
         "verification": verification_results,
         "document_count": total_count,
         "successful_files": successful_files,
+        "duplicates_removed": duplicates_removed,
     }
 
     if errors:
@@ -820,6 +853,8 @@ def _build_full_prevet_sync(
                     bank_name=result["bank_name"],
                     bank_id=result.get("bank_id", ""),
                     account_number=result.get("account_number"),
+                    declared_totals=result.get("declared_totals"),
+                    unreadable_descriptions=result.get("unreadable_descriptions", 0),
                 )
                 result["df"] = None
                 verification_results.append(vr)

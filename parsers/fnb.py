@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from .base import AccountInfo, BaseBankParser
+from .base import AccountInfo, BaseBankParser, DeclaredTotals
 from .utils import (
     MONTH_MAP,
     create_transaction_row,
@@ -22,9 +22,42 @@ try:
     import pytesseract
     from PIL import Image as _  # noqa: F401
 
-    _OCR_AVAILABLE = True
+    _OCR_IMPORTED = True
 except ImportError:
-    _OCR_AVAILABLE = False
+    _OCR_IMPORTED = False
+
+# Tri-state cache for the tesseract binary probe: None = not probed yet.
+# The import above only proves the pytesseract *wrapper* is installed; the
+# binary it shells out to is a separate system package (see Dockerfile).
+# Without this probe a machine missing the binary silently drops every
+# image-rendered description, because the resulting TesseractNotFoundError is
+# indistinguishable from "OCR read nothing" inside the per-image except.
+_TESSERACT_AVAILABLE: bool | None = None
+
+
+def _ocr_available() -> bool:
+    """Whether OCR can actually run: wrapper importable AND binary present.
+
+    Probes the binary once per process and warns loudly if it is missing —
+    FNB renders some fee descriptions as images, so a silent no-OCR
+    environment produces transactions with no description at all.
+    """
+    global _TESSERACT_AVAILABLE
+
+    if not _OCR_IMPORTED:
+        return False
+    if _TESSERACT_AVAILABLE is None:
+        try:
+            pytesseract.get_tesseract_version()
+            _TESSERACT_AVAILABLE = True
+        except Exception as e:
+            _TESSERACT_AVAILABLE = False
+            logger.warning(
+                "tesseract binary not available (%s): FNB fee descriptions "
+                "rendered as images cannot be read and will be reported as "
+                "'Unspecified'. Install tesseract-ocr to recover them.", e
+            )
+    return _TESSERACT_AVAILABLE
 
 
 class FNBParser(BaseBankParser):
@@ -165,7 +198,57 @@ class FNBParser(BaseBankParser):
             bank=self.BANK_NAME,
             account_number=account_number,
             account_type=account_type,
+            declared_totals=self._extract_declared_totals(full_text),
         )
+
+    # Statement Balances box, e.g. "Opening Balance      171,855.49Cr"
+    _DECLARED_OPENING_RE = re.compile(
+        r"Opening\s+Balance\s+([\d,]+\.\d{2})\s*(Cr|Kt|Dr)?", re.IGNORECASE
+    )
+    _DECLARED_CLOSING_RE = re.compile(
+        r"Closing\s+Balance\s+([\d,]+\.\d{2})\s*(Cr|Kt|Dr)?", re.IGNORECASE
+    )
+    # Turnover block, e.g. "No. Credit Transactions 36    388,987.60Cr"
+    _DECLARED_CREDITS_RE = re.compile(
+        r"No\.\s*Credit\s+Transactions\s+(\d+)\s+([\d,]+\.\d{2})", re.IGNORECASE
+    )
+    _DECLARED_DEBITS_RE = re.compile(
+        r"No\.\s*Debit\s+Transactions\s+(\d+)\s+([\d,]+\.\d{2})", re.IGNORECASE
+    )
+
+    def _extract_declared_totals(self, full_text: str) -> DeclaredTotals | None:
+        """Read the control totals FNB prints about the statement itself.
+
+        These come from the bank, not from our parse of the transaction rows,
+        so verification can use them to prove the parse is complete rather
+        than merely self-consistent. Returns None when the statement declares
+        nothing (older layouts, Transaction History exports).
+        """
+        totals = DeclaredTotals()
+
+        for attr, pattern in (
+            ("opening_balance", self._DECLARED_OPENING_RE),
+            ("closing_balance", self._DECLARED_CLOSING_RE),
+        ):
+            m = pattern.search(full_text)
+            if m:
+                val = self._clean_amount(m.group(1))
+                suffix = (m.group(2) or "").lower()
+                setattr(totals, attr, val if suffix in ("cr", "kt") else -val)
+
+        m = self._DECLARED_CREDITS_RE.search(full_text)
+        if m:
+            totals.credit_count = int(m.group(1))
+            totals.credit_total = self._clean_amount(m.group(2))
+
+        m = self._DECLARED_DEBITS_RE.search(full_text)
+        if m:
+            totals.debit_count = int(m.group(1))
+            totals.debit_total = self._clean_amount(m.group(2))
+
+        if all(v is None for v in totals.to_dict().values()):
+            return None
+        return totals
 
     def _clean_amount(self, amt: str) -> float:
         """Clean FNB amount string to float."""
@@ -280,7 +363,7 @@ class FNBParser(BaseBankParser):
 
         Returns the OCR'd text or None.
         """
-        if not _OCR_AVAILABLE:
+        if not _ocr_available():
             return None
 
         ocr_calls = getattr(self, "_ocr_calls", 0)
@@ -480,6 +563,40 @@ class FNBParser(BaseBankParser):
         val = self._clean_amount(amount_str)
         return val, has_cr
 
+    _SUMMARY_BALANCE_RE = re.compile(
+        r"([\d,]+\.\d{2})\s*(Cr|Kt|Dr)?", re.IGNORECASE
+    )
+
+    def _parse_summary_balance(self, row_words: list[dict]) -> float | None:
+        """Parse a balance out of a Statement Balances summary-box line.
+
+        The summary box is not laid out on the transaction table's column
+        grid, so the figure lands outside the Balance band and positional
+        extraction finds nothing.  Fall back to reading the line left to
+        right: Statement Balances is the leftmost column, so the first
+        amount is the balance and later ones belong to the adjacent Bank
+        Charges / Interest Rate columns::
+
+            Opening Balance  171,855.49Cr  Service Fees  167.00Dr  ...
+
+        ``row_words`` must be re-sorted by x here: pdfplumber yields words in
+        content-stream order, which for this box interleaves the columns
+        ("Service Fees 167.00Dr Opening Balance 171,855.49Cr") and would
+        otherwise hand back the service fee.
+
+        Returns the signed balance (Cr/Kt positive, anything else negative),
+        or None when the line carries no amount at all.
+        """
+        text = " ".join(
+            w["text"].strip() for w in sorted(row_words, key=lambda w: w["x0"])
+        )
+        m = self._SUMMARY_BALANCE_RE.search(text)
+        if not m:
+            return None
+        val = self._clean_amount(m.group(1))
+        suffix = (m.group(2) or "").lower()
+        return val if suffix in ("cr", "kt") else -val
+
     def _extract_bank_statement_page_positional(
         self,
         page,
@@ -544,14 +661,22 @@ class FNBParser(BaseBankParser):
             all_text = " ".join(w["text"].strip() for w in row_words)
             all_lower = all_text.lower()
             if "opening balance" in all_lower or "statement balance" in all_lower or "openingsaldo" in all_lower:
+                balance = None
                 for bw in balance_words:
                     parsed = self._parse_amount_word(bw["text"])
                     if parsed:
                         val, has_cr = parsed
                         balance = val if has_cr else -val
-                        rows.append(create_transaction_row("", "Opening Balance", 0.0, 0.0, balance))
-                        previous_balance = balance
                         break
+                if balance is None and previous_balance is None:
+                    # Summary-box layout: the figure sits outside the Balance
+                    # band, so read it off the line instead.  Gated on
+                    # previous_balance to keep this to the opening anchor only
+                    # — a later summary box cannot re-anchor the chain.
+                    balance = self._parse_summary_balance(row_words)
+                if balance is not None:
+                    rows.append(create_transaction_row("", "Opening Balance", 0.0, 0.0, balance))
+                    previous_balance = balance
                 continue
             if "closing balance" in all_lower or "sluitsaldo" in all_lower:
                 for bw in balance_words:
@@ -649,6 +774,7 @@ class FNBParser(BaseBankParser):
 
             if not description:
                 description = "Unspecified"
+                self.unreadable_descriptions += 1
 
             rows.append(create_transaction_row(date_str, description, tx_debit, tx_credit, balance))
             previous_balance = balance

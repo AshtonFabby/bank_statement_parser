@@ -4,8 +4,11 @@ This package provides parsers for various South African bank statements.
 """
 
 import io
+import logging
 from pathlib import Path
 from typing import Optional, Type, Union
+
+logger = logging.getLogger(__name__)
 
 from .base import AccountInfo, BaseBankParser
 from .capitec import CapitecParser
@@ -69,6 +72,49 @@ def _unwrap_java_serialized_pdf(pdf_file: io.BytesIO) -> io.BytesIO:
     return pdf_file
 
 
+# A statement's own branding sits in its letterhead and footer, while other
+# banks appear in the transaction body ("CAPITEC ...PosSettle"). This window
+# is therefore the identity zone, and a win inside it is worth trusting.
+_IDENTITY_ZONE_HEAD = 50
+_IDENTITY_ZONE_TAIL = 10
+
+# How decisive an identity-zone win must be before we stop looking. A bank
+# brands its own letterhead heavily (median score 24 across the corpus),
+# whereas a passing reference that happens to fall in the zone scores <= 5.
+# Measured zero-error plateau on the 194-statement corpus is 6..12; 8 sits in
+# the middle. Below this we defer to the wider page rather than trusting a
+# thin signal — that is what stops a lone "ABSA" mention hijacking an
+# Investec statement.
+_IDENTITY_ZONE_MIN_SCORE = 8
+
+
+def _score_text(text: str):
+    """Score every parser against some text.
+
+    Returns ``(best_parser, best_score, runner_up)`` where ``runner_up`` is
+    ``(score, bank_id)`` for the next best, or None. The runner-up is what
+    lets the caller judge how clear-cut the win was.
+    """
+    scored = []
+    for parser_class in PARSER_REGISTRY:
+        score = parser_class.detection_score(text)
+        if score > 0:
+            scored.append((score, parser_class))
+
+    if not scored:
+        return None, 0, None
+
+    # max() keeps the first of equal scores, and PARSER_REGISTRY lists
+    # specific banks before generic ones, so ties break as the registry intends.
+    best_score, best_parser = max(scored, key=lambda s: s[0])
+    others = [(s, c.BANK_ID) for s, c in scored if c is not best_parser]
+    return best_parser, best_score, (max(others) if others else None)
+
+
+def _page_text(pdf, indexes) -> str:
+    return "\n".join((pdf[i].get_text() or "") for i in indexes)
+
+
 def detect_bank(pdf_file: Union[str, Path, bytes, bytearray, io.BytesIO]) -> Optional[str]:
     """Detect which bank the statement is from.
 
@@ -101,26 +147,48 @@ def detect_bank(pdf_file: Union[str, Path, bytes, bytearray, io.BytesIO]) -> Opt
         return "INVALID_PDF"
     with pdf_context as pdf:
         if len(pdf) > 0:
-            first_page_text = pdf[0].get_text() or ""
-            # Limit to first 20 lines so transaction references to other banks
-            # don't inflate scores above the actual issuing bank's branding.
-            # Nedbank statements have branding on line 13 (nedbank.co.za) and
-            # ABSA Transaction History has "ABSA" on line 6.
-            # Also include the last 5 lines (footer) because some FNB formats
-            # only carry branding in the page footer.
-            _lines = first_page_text.split("\n")
-            header_text = "\n".join(_lines[:50] + _lines[-10:])
+            # Widen the search in stages, stopping as soon as the evidence is
+            # good enough. Scoring the whole page unconditionally does not
+            # work: statements that receive payments from another bank repeat
+            # that bank's name in the transaction body (a Standard Bank
+            # statement carrying six "CAPITEC ...PosSettle" lines scores
+            # capitec 60 vs standard_bank 24), so the body must not outvote
+            # the letterhead.
+            page1 = pdf[0].get_text() or ""
+            _lines = page1.split("\n")
+            identity_zone = "\n".join(
+                _lines[:_IDENTITY_ZONE_HEAD] + _lines[-_IDENTITY_ZONE_TAIL:]
+            )
 
-            best_parser = None
-            best_score = 0
+            # 1. Letterhead + footer, trusted only when clearly branded.
+            best_parser, best_score, runner_up = _score_text(identity_zone)
 
-            for parser_class in PARSER_REGISTRY:
-                score = parser_class.detection_score(header_text)
-                if score > best_score:
-                    best_score = score
-                    best_parser = parser_class
+            if best_parser is None or best_score < _IDENTITY_ZONE_MIN_SCORE:
+                # 2. All of page 1 — catches layouts that brand below the
+                #    letterhead (ABSA from line 67, Investec from line 79),
+                #    which the zone above cannot see.
+                wider = _score_text(page1)
+                if wider[0] is not None:
+                    best_parser, best_score, runner_up = wider
+
+            if best_parser is None and len(pdf) > 1:
+                # 3. Pages 1-3 — some exports carry no branding on page 1 at
+                #    all and only identify themselves further in.
+                best_parser, best_score, runner_up = _score_text(
+                    _page_text(pdf, range(min(3, len(pdf))))
+                )
 
             if best_parser is not None:
+                # A narrow margin means the winner is not clearly branded and
+                # the pick may be wrong. Misrouting is the costly failure —
+                # the caller still gets a 200 with plausible-looking numbers —
+                # so make it visible instead of silent.
+                if runner_up and best_score - runner_up[0] <= 1:
+                    logger.warning(
+                        "Low-confidence bank detection: %s (score %d) barely beat "
+                        "%s (score %d); the statement may be misrouted.",
+                        best_parser.BANK_ID, best_score, runner_up[1], runner_up[0],
+                    )
                 if hasattr(pdf_file, "seek"):
                     pdf_file.seek(0)
                 return best_parser.BANK_ID

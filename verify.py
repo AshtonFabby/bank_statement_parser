@@ -78,6 +78,7 @@ def process_file(pdf_path: Path) -> dict:
 
     try:
         account_info, df = parser.parse()
+        unreadable_descriptions = parser.unreadable_descriptions
     except Exception as e:
         return {"error": f"Failed to parse statement: {e}"}
 
@@ -90,6 +91,8 @@ def process_file(pdf_path: Path) -> dict:
         bank_name=account_info.bank,
         bank_id=bank_id,
         account_number=account_info.account_number,
+        declared_totals=account_info.declared_totals,
+        unreadable_descriptions=unreadable_descriptions,
     )
     return result.to_dict(), corrected_df
 

@@ -10,17 +10,55 @@ import pdfplumber
 
 
 @dataclass
+class DeclaredTotals:
+    """Control totals the statement declares about itself.
+
+    Some banks print a turnover summary alongside the transaction table::
+
+        Closing Balance                     21,565.02Cr
+        No. Credit Transactions 36          388,987.60Cr
+        No. Debit Transactions  51          539,278.07Dr
+
+    These are an oracle independent of the transaction rows themselves, so
+    they can catch a dropped, duplicated or misclassified row that the
+    running-balance check cannot. Every field is optional: a statement may
+    declare some, all or none of them.
+    """
+    opening_balance: Optional[float] = None
+    closing_balance: Optional[float] = None
+    credit_count: Optional[int] = None
+    credit_total: Optional[float] = None
+    debit_count: Optional[int] = None
+    debit_total: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "opening_balance": self.opening_balance,
+            "closing_balance": self.closing_balance,
+            "credit_count": self.credit_count,
+            "credit_total": self.credit_total,
+            "debit_count": self.debit_count,
+            "debit_total": self.debit_total,
+        }
+
+
+@dataclass
 class AccountInfo:
     """Data class for account information."""
     bank: str
     account_number: Optional[str] = None
     account_type: Optional[str] = None
+    # Only populated by parsers whose statements print control totals.
+    declared_totals: Optional[DeclaredTotals] = None
 
     def to_dict(self) -> dict:
         return {
             "bank": self.bank,
             "account_number": self.account_number,
             "account_type": self.account_type,
+            "declared_totals": (
+                self.declared_totals.to_dict() if self.declared_totals else None
+            ),
         }
 
 
@@ -39,6 +77,10 @@ class BaseBankParser(ABC):
     def __init__(self, pdf_file: io.BytesIO):
         self.pdf_file = pdf_file
         self._page_texts_cache: Optional[list[str]] = None
+        # Transactions whose description could not be read at all and fell
+        # back to a placeholder. Non-zero means real data was lost, so it is
+        # counted rather than left for a reader to notice.
+        self.unreadable_descriptions: int = 0
         self._reset_file()
 
     def _reset_file(self) -> None:

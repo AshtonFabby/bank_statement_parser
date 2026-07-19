@@ -155,13 +155,31 @@ class AlbarakaParser(BaseBankParser):
             account_type=account_type,
         )
 
+    # Sections printed after the transaction table whose rows are not
+    # transactions on the account. "Account Effects Not Cleared" lists card
+    # authorisations that have not settled: they carry a zero balance and
+    # dates outside the statement period, so treating them as transactions
+    # both breaks the running balance and overstates money actually spent.
+    SECTION_TERMINATORS = [
+        re.compile(r"^Account Effects Not Cleared", re.IGNORECASE),
+    ]
+
+    def _is_section_terminator(self, line: str) -> bool:
+        return any(pattern.match(line) for pattern in self.SECTION_TERMINATORS)
+
     def _merge_continuation_lines(self, lines: list[str]) -> list[str]:
-        """Merge continuation lines (no date prefix) with the preceding transaction."""
+        """Merge continuation lines (no date prefix) with the preceding transaction.
+
+        Stops at the first post-transaction section: everything after it
+        describes uncleared effects rather than account activity.
+        """
         merged = []
         for line in lines:
             stripped = line.strip()
             if not stripped:
                 continue
+            if self._is_section_terminator(stripped):
+                break
             if self._should_skip_line(stripped):
                 continue
             if self._is_transaction_start(stripped):
@@ -169,6 +187,39 @@ class AlbarakaParser(BaseBankParser):
             elif merged:
                 merged[-1] = merged[-1] + " " + stripped
         return merged
+
+    def _find_column_run(self, rest: str):
+        """Locate the Fee/Debit/Credit/Balance block in a merged line.
+
+        The four columns are printed consecutively, separated only by
+        whitespace, and any continuation text follows the balance. Taking the
+        *last four* amounts on the line therefore breaks whenever a wrapped
+        description carries its own figure::
+
+            ... GMORE 0.00 221.18 0.00 131,083.75
+            DISTRIBUTION D DURBAN ZA (ZAR 221.18) [No Base 1]
+
+        Merged, that yields five amounts, and the last four shift every column
+        by one: the balance becomes 221.18 and the credit becomes the balance.
+
+        Anchoring on the first run of four consecutive amounts instead ignores
+        anything the continuation contributes. Returns the run's match objects,
+        or None when the line has no complete column block.
+        """
+        matches = list(self.AMOUNT_PATTERN.finditer(rest))
+        if len(matches) < 4:
+            return None
+
+        run = [matches[0]]
+        for prev, current in zip(matches, matches[1:]):
+            between = rest[prev.end():current.start()]
+            if between.strip() == "":
+                run.append(current)
+            else:
+                if len(run) >= 4:
+                    return run
+                run = [current]
+        return run if len(run) >= 4 else None
 
     def _parse_merged_transaction(
         self, line: str, prev_balance: float | None, date_format: str = "ymd8"
@@ -200,8 +251,11 @@ class AlbarakaParser(BaseBankParser):
             else:
                 return None
 
-        # Check for BALANCE BROUGHT FORWARD
-        if rest and re.match(r"BALANCE\s+BROUGHT\s+FORWARD", rest, re.IGNORECASE):
+        # Check for BALANCE BROUGHT [FORWARD]. The My Statements export
+        # truncates the label to "BALANCE BROUGHT", so requiring "FORWARD"
+        # dropped the opening balance and left the first transaction
+        # unverified.
+        if rest and re.match(r"BALANCE\s+BROUGHT(\s+FORWARD)?\b", rest, re.IGNORECASE):
             amounts = self.AMOUNT_PATTERN.findall(rest)
             if amounts:
                 balance = self._clean_amount(amounts[-1])
@@ -227,35 +281,19 @@ class AlbarakaParser(BaseBankParser):
             return None
 
         # For dmy4 format, amounts are: Fee, Debit, Credit, Balance (always 4 columns)
-        if is_dmy4 and len(amounts) >= 4:
-            # Use explicit columns — last 4 amounts are Fee, Debit, Credit, Balance
-            fee = self._clean_amount(amounts[-4])
-            col_debit = self._clean_amount(amounts[-3])
-            col_credit = self._clean_amount(amounts[-2])
-            balance = self._clean_amount(amounts[-1])
-            debit = fee + col_debit
-            credit = col_credit
+        if is_dmy4:
+            column_run = self._find_column_run(rest)
+            if column_run is not None:
+                fee, col_debit, col_credit, balance = (
+                    self._clean_amount(m.group(0)) for m in column_run[-4:]
+                )
+                debit = fee + col_debit
+                credit = col_credit
 
-            # Description is before the first of the 4 column amounts
-            # Find position of the 4th-from-last amount
-            desc_amt_pattern = self.AMOUNT_PATTERN
-            all_amt_matches = list(desc_amt_pattern.finditer(rest))
-            if len(all_amt_matches) >= 4:
-                column_start = all_amt_matches[-4].start()
-                description = rest[:column_start].strip()
-            else:
-                description = rest
-                for amt in amounts[-4:]:
-                    # Remove the Fee/Debit/Credit/Balance amounts from the end of description
-                    pass
-                first_amt_match = desc_amt_pattern.search(rest)
-                if first_amt_match:
-                    description = rest[:first_amt_match.start()].strip()
-                else:
-                    description = rest
-            description = re.sub(r"\s+", " ", description)
-
-            return create_transaction_row(trans_date_str, description, debit, credit, balance)
+                description = re.sub(r"\s+", " ", rest[:column_run[-4].start()].strip())
+                return create_transaction_row(
+                    trans_date_str, description, debit, credit, balance
+                )
 
         # For ymd8 format (or dmy4 with fewer than 4 amounts), use balance progression
         balance = self._clean_amount(amounts[-1])

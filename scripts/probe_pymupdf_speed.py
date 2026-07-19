@@ -1,7 +1,7 @@
 import fitz
 import time
 
-def test_speed(file_path):
+def probe_speed(file_path):
     print(f"Testing {file_path} with PyMuPDF")
     t0 = time.time()
     
@@ -30,4 +30,4 @@ def test_speed(file_path):
     print(f"Extract tables: {t1-t0:.3f}s")
 
 if __name__ == "__main__":
-    test_speed(r"bank_statements\1._Jan-4067.pdf")
+    probe_speed(r"bank_statements\1._Jan.pdf")

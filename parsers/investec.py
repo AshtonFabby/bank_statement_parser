@@ -407,13 +407,23 @@ class InvestecParser(BaseBankParser):
             parts.append(suffix_desc)
         description = " ".join(parts)
 
-        if "interestadvised" in description.lower().replace(" ", ""):
+        # These statements print two balance columns side by side — Capital and
+        # Interest ("Date Description Amount Balance Rate% Days Amount
+        # Balance"). Interest rows carry the *interest* balance, so folding
+        # them into the capital chain reads as a wild jump (1,663,031.75DR to
+        # 14,712.15DR) and breaks every subsequent row.
+        if any(
+            marker in description.lower().replace(" ", "")
+            for marker in ("interestadvised", "revisedinterest", "interestaccrued")
+        ):
             return None
 
         parsed = [(self._clean_amount(m.group(1)), m.group(2).upper()) for m in dr_cr_matches]
 
         if len(parsed) == 1:
             amt, typ = parsed[0]
+            debit = 0.0
+            credit = 0.0
             if typ == "DR":
                 debit = amt
                 balance = -amt
