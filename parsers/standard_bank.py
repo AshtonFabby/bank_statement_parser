@@ -246,6 +246,33 @@ class StandardBankParser(BaseBankParser):
         "sep": 9, "oct": 10, "nov": 11, "dec": 12,
     }
 
+    def _statement_year_resolver(self, first_page: str, default_year: str):
+        """Map a transaction month (1-12) to its year for MM-DD business formats.
+
+        Business statements print only MM DD per row, so the year comes from the
+        'Statement from <d> <Month> <YYYY> to <d> <Month> <YYYY>' header. When the
+        period crosses a year boundary (Dec -> Jan) a single year is wrong for half
+        the rows, so resolve per month: months on/after the start month keep the
+        start year, earlier months take the end year.
+        """
+        m = re.search(
+            r"Statement\s+from\s+\d{1,2}\s+([A-Za-z]+)\s+(\d{4})"
+            r"\s+to\s+\d{1,2}\s+([A-Za-z]+)\s+(\d{4})",
+            first_page, re.IGNORECASE,
+        )
+        if not m:
+            return lambda month_num: default_year
+        # The header spells months out in full ("December"); MONTH_ORDER is
+        # keyed by 3-letter abbreviations, so slice before looking up.
+        start_mn = self.MONTH_ORDER.get(m.group(1).lower()[:3], 0)
+        start_yr = m.group(2)
+        end_yr = m.group(4)
+        if start_mn == 0:
+            return lambda month_num: default_year
+        if start_yr == end_yr:
+            return lambda month_num: start_yr
+        return lambda month_num: start_yr if month_num >= start_mn else end_yr
+
     def _extract_transactions_history(self) -> pd.DataFrame:
         """Extract transactions from Standard Bank transactional history format.
 
@@ -422,6 +449,8 @@ class StandardBankParser(BaseBankParser):
         if period_match:
             year = period_match.group(2)  # Use the "to" year
 
+        year_of = self._statement_year_resolver(first_page, default_year=year)
+
         for page_text in self._iterate_pages():
             lines = page_text.split("\n")
             in_header = True
@@ -456,7 +485,7 @@ class StandardBankParser(BaseBankParser):
                 month = end_match.group(1)
                 day = end_match.group(2)
                 balance = self._parse_biz_amount(end_match.group(3))
-                date_str = f"{day}/{month}/{year}"
+                date_str = f"{day}/{month}/{year_of(int(month))}"
 
                 # Get text before the date+balance
                 before_end = line[:end_match.start()].strip()
@@ -514,6 +543,8 @@ class StandardBankParser(BaseBankParser):
         if period_match:
             year = period_match.group(2)
 
+        year_of = self._statement_year_resolver(first_page, default_year=year)
+
         for page_text in self._iterate_pages():
             lines = page_text.split("\n")
             in_header = True
@@ -549,7 +580,7 @@ class StandardBankParser(BaseBankParser):
                 month = end_match.group(1)
                 day = end_match.group(2)
                 balance = self._clean_amount(end_match.group(3))
-                date_str = f"{day}/{month}/{year}"
+                date_str = f"{day}/{month}/{year_of(int(month))}"
 
                 # Get text before the date+balance
                 before_end = line[:end_match.start()].strip()

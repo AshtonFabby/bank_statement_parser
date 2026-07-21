@@ -5,6 +5,8 @@ document scored near 0% before normalisation. These tests cover both the
 pure ordering logic (no PDF needed) and the real statements.
 """
 
+import io
+
 import pandas as pd
 import pytest
 
@@ -85,6 +87,34 @@ def test_opening_balance_stays_first_after_reversal():
 def test_undated_rows_do_not_crash():
     out = _normalise([["", "no date", 0.0, 0.0, 1000.0]])
     assert len(out) == 1
+
+
+def _resolver(period_line, default="2000"):
+    """Build a business-statement year resolver without needing a real PDF."""
+    parser = StandardBankParser(io.BytesIO(b""))
+    return parser._statement_year_resolver(period_line, default_year=default)
+
+
+def test_year_resolver_crosses_dec_jan_boundary():
+    """Dec->Jan statements carry only MM DD per row, so December must keep the
+    start year and January take the end year — not one 'to' year for both.
+
+    Regression for the real bug: a Dec/Jan statement stamped every row 2026,
+    pushing December 2025 to December 2026."""
+    resolve = _resolver("Statement from 05 December 2025 to 03 January 2026")
+    assert resolve(12) == "2025"
+    assert resolve(1) == "2026"
+
+
+def test_year_resolver_same_year_period_uses_that_year():
+    resolve = _resolver("Statement from 05 July 2025 to 04 August 2025")
+    assert resolve(7) == "2025"
+    assert resolve(8) == "2025"
+
+
+def test_year_resolver_falls_back_when_no_period_line():
+    resolve = _resolver("no recognisable period here", default="2024")
+    assert resolve(6) == "2024"
 
 
 @pytest.mark.parametrize("filename", ["2. Dec.pdf", "6. TH.pdf"])
