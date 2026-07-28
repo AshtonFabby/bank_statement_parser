@@ -15,7 +15,7 @@ class CapitecParser(BaseBankParser):
     BANK_NAME = "Capitec"
     BANK_ID = "capitec"
     DETECTION_KEYWORDS = [
-        ("capitec", 10),
+        ("capitec", 2),
         ("capitec bank", 15),
         ("capitecbank.co.za", 15),
         ("FSP46669", 15),
