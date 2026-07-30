@@ -43,9 +43,7 @@ UNRELIABLE_SOURCE = {
 # Banks with no example of a document kind anywhere in the corpus. These are
 # collection gaps, not parser defects — the format cannot be regression-tested
 # until an example exists.
-CORPUS_GAPS = {
-    "investec": "no transaction-history export; both Investec formats are statements",
-}
+CORPUS_GAPS = {}
 
 # Formats whose documents genuinely do not print an opening balance, so the
 # first transaction cannot be verified against anything. Deriving one from the
@@ -54,6 +52,7 @@ CORPUS_GAPS = {
 MISSING_ANCHOR = {
     "StdBank/txn-export",
     "FNB/txn-history",
+    "Investec/txn-history",
 }
 
 # family -> (bank_id, kind, [relative paths])
@@ -98,6 +97,29 @@ CORPUS = {
         "Investec/1. Jun.pdf",
         "Investec/4. Sep.pdf",
         "Investec/6. Nov.pdf",
+    ]),
+    # Call-deposit statements whose page carries a spurious one-cell "table"
+    # (the rotated date watermark) that used to shadow the real transactions
+    # and return zero rows.
+    "Investec/call-deposit": ("investec", "BS", [
+        "Investec accounts/Investec accounts/Investec Electronic account Number 50019941900/11. May.pdf",
+        "Investec accounts/Investec accounts/Investec Electronic account Number 50019941900/2. Aug.pdf",
+    ]),
+    # Corporate Card Account statements. Two renderings ship under this
+    # layout: squished no-space dates ("1Jul2025") and spaced dates
+    # ("1 Jan 2026"), both with a single plain amount + running balance.
+    "Investec/corporate-card": ("investec", "BS", [
+        "Investec accounts/Investec accounts/Investec 10013405974/1. Jul.pdf",
+        "Investec accounts/Investec accounts/Investec 10013405974/7. Jan.pdf",
+    ]),
+    # Business Online transaction-history export. One per account type — the
+    # card, business and call-deposit exports differ in columns and wrapping.
+    # Emits no opening balance and is sorted most-recent-first (see
+    # MISSING_ANCHOR).
+    "Investec/txn-history": ("investec", "TH", [
+        "Investec accounts/Investec accounts/Investec 10013405974/13. TH.pdf",
+        "Investec accounts/Investec accounts/Investec 40005075440/13. TH.pdf",
+        "Investec accounts/Investec accounts/Investec Electronic account Number 50019941900/13. TH.pdf",
     ]),
     "Nedbank/statement-pdf": ("nedbank", "BS", [
         "Nedbank/1. 25 Apr - 24 May.pdf",

@@ -25,8 +25,11 @@ class InvestecParser(BaseBankParser):
     DATE_PATTERN_SLASH = re.compile(
         r"(\d{2})/(\d{2})/(\d{4})"
     )
-    # Amount pattern with optional R prefix and optional minus sign
-    AMOUNT_PATTERN = re.compile(r"-?R?[\d,]+\.\d{2}")
+    # Amount pattern with optional R prefix and optional minus sign.
+    # The trailing negative lookahead prevents matching the "19.01" fragment
+    # of an embedded date like "19.01.2026" (which appears inside some
+    # transaction descriptions) as a spurious amount.
+    AMOUNT_PATTERN = re.compile(r"-?R?[\d,]+\.\d{2}(?![.\d])")
     # Date pattern: DDMMMYYYY with no spaces (e.g., "1MAY2026")
     DATE_PATTERN_NOSPACE = re.compile(
         r"(\d{1,2})(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{4})",
@@ -36,6 +39,10 @@ class InvestecParser(BaseBankParser):
     AMOUNT_DRCR_PATTERN = re.compile(
         r"([\d,]+\.\d{2})(DR|CR)", re.IGNORECASE
     )
+    # Business Online (transaction-history export) amount: "R 429.99" is a
+    # credit, "- R 429.99" a debit (note the space after R). group(1) present
+    # means the amount is negative (a debit / an overdrawn balance).
+    TH_AMOUNT_PATTERN = re.compile(r"(-\s*)?R\s+([\d,]+\.\d{2})")
 
     # Lines to skip during text-based parsing
     _SKIP_MARKERS = [
@@ -55,6 +62,17 @@ class InvestecParser(BaseBankParser):
         "aregisteredcreditprovider",
         "australiabotswanacanada",
         "ofpwcourexternalauditors",
+        # Call-deposit statement footer (otherwise merged into the last
+        # transaction's description by the text fallback).
+        "growyoursavings",
+        "moneyfundlinked",
+        "calluson",
+        "investecspecialistbank",
+        "ombudsmanforbanking",
+        # Corporate-card statement footers / summary-section headers.
+        "cardtransactions",
+        "onlinepayments",
+        "beforemarch2018",
     ]
 
     def _is_skip_line(self, line: str) -> bool:
@@ -449,42 +467,377 @@ class InvestecParser(BaseBankParser):
 
         return create_transaction_row(date_str, description, debit, credit, balance)
 
-    def _iter_transaction_lines(self):
-        """Yield transaction text lines from the PDF.
+    def _detect_statement_format(self) -> str:
+        """Classify which Investec layout this statement uses.
 
-        Uses table extraction when available (which correctly groups
-        multi-line description rows), falling back to text-based merging
-        for pages without detectable tables.
+        Investec ships several distinct layouts under the same brand; each
+        needs different line grouping:
+
+        - ``corporate_card`` — Corporate Card Account Statement. Clean, one
+          transaction per line (single amount + running balance), plus
+          duplicate summary sections that must be excluded.
+        - ``call_deposit`` — Call Deposit / Electronic account. DR/CR amounts,
+          dual balance columns, heavy multi-line wrapping; all data is in the
+          page text.
+        - ``business`` — Business / transactional account (the default).
         """
+        cached = getattr(self, "_statement_format", None)
+        if cached is not None:
+            return cached
+        first = self._extract_first_page_text().lower()
+        if "investec business online" in first:
+            # Transaction-history export (any account type). Signed "- R x"
+            # amounts, most-recent-first ordering, no opening balance.
+            fmt = "th_export"
+        elif "corporate card account statement" in first:
+            fmt = "corporate_card"
+        elif "call deposit" in first or "electronic account number" in first:
+            fmt = "call_deposit"
+        else:
+            fmt = "business"
+        self._statement_format = fmt
+        return fmt
+
+    def _looks_like_transaction(self, text: str) -> bool:
+        """Whether a table cell / line plausibly holds a transaction.
+
+        Used to reject spurious pdfplumber tables — on many pages pdfplumber
+        detects a one-cell "table" containing only the rotated date watermark
+        (e.g. ``"31 May 2026"``). Such a cell has a date but no amount, so it
+        is rejected and the page falls back to text extraction.
+        """
+        low = text.lower().replace(" ", "")
+        if any(m in low for m in ("openingbalance", "closingbalance", "balancebroughtforward")):
+            return True
+        has_date = self._search_date(text) is not None
+        has_amount = bool(
+            self.AMOUNT_PATTERN.search(text) or self.AMOUNT_DRCR_PATTERN.search(text)
+        )
+        return has_date and has_amount
+
+    def _iter_corporate_card_lines(self):
+        """Yield transaction lines from a Corporate Card statement.
+
+        Each transaction is a self-contained single line
+        (``PostedDate TransDate Description Amount Balance``), so no
+        multi-line merging is needed. Yields only lines inside the
+        "Transaction detail" region — from "Balance brought forward" to
+        "Closing Balance" — which excludes the duplicate "Card transactions"
+        and "Online payments" summary sections that would otherwise inject
+        phantom rows.
+        """
+        in_section = False
+        for text in self._get_page_texts():
+            if not text:
+                continue
+            for raw in text.split("\n"):
+                line = raw.strip()
+                if not line:
+                    continue
+                low = line.lower().replace(" ", "")
+                if "balancebroughtforward" in low:
+                    in_section = True
+                    yield line  # opening balance
+                    continue
+                if "posteddate" in low and "transdate" in low:
+                    in_section = True  # per-page column header
+                    continue
+                if not in_section:
+                    continue
+                if "closingbalance" in low:
+                    in_section = False
+                    continue
+                if self._is_skip_line(line):
+                    continue
+                # Real transaction rows start with a date (DD MMM YYYY); the
+                # rotated "01 February 2026" watermark uses a full month name
+                # and is not matched, so it is naturally excluded.
+                if self._find_date_at_start(line):
+                    yield line
+
+    def _parse_card_line(self, line: str, rows: list[dict]) -> dict | None:
+        """Parse one Corporate Card transaction line.
+
+        These statements print a single amount + running balance per row and
+        come in two renderings — spaced (``1 Jan 2026``) and squished
+        (``1Jul2025``) — both with plain (no DR/CR) amounts. Debit vs credit
+        is inferred from the running-balance movement (per the agreed
+        approach): a falling balance is a debit, a rising balance a credit.
+        """
+        line = line.strip()
+        if not line:
+            return None
+
+        low = line.lower().replace(" ", "")
+        if "balancebroughtforward" in low or "openingbalance" in low:
+            amounts = self.AMOUNT_PATTERN.findall(line)
+            if amounts:
+                return create_transaction_row(
+                    "", "Opening Balance", 0.0, 0.0, self._clean_amount(amounts[-1])
+                )
+            return None
+        if "closingbalance" in low:
+            return None
+
+        date_info = self._find_date_at_start(line)
+        if not date_info:
+            return None
+        date_str = self._parse_date_from_match(date_info)
+        rest = line[date_info[0].end():].strip()
+
+        # Optional second (transaction) date — same or different rendering.
+        second = self._find_date_at_start(rest)
+        if second:
+            rest = rest[second[0].end():].strip()
+
+        amounts = list(self.AMOUNT_PATTERN.finditer(rest))
+        if not amounts:
+            return None
+        cleaned = [self._clean_amount(m.group(0)) for m in amounts]
+
+        inline_desc = rest[:amounts[0].start()].strip()
+        suffix_desc = rest[amounts[-1].end():].strip()
+        description = " ".join(p for p in (inline_desc, suffix_desc) if p)
+
+        balance = cleaned[-1]
+        debit = credit = 0.0
+        prev = rows[-1]["Balance"] if rows else None
+
+        if len(cleaned) >= 2:
+            amount = cleaned[-2]
+            if prev is not None and round(balance - prev, 2) < 0:
+                debit = amount
+            else:
+                credit = amount
+        elif prev is not None:
+            diff = round(balance - prev, 2)
+            if diff < 0:
+                debit = -diff
+            else:
+                credit = diff
+
+        return create_transaction_row(date_str, description, debit, credit, balance)
+
+    # ------------------------------------------------------------------
+    # Business Online transaction-history export ("13. TH.pdf")
+    # ------------------------------------------------------------------
+
+    _TH_SKIP_MARKERS = (
+        "investecbusinessonline",
+        "accounts/details",
+        "currency:",
+        "filter",
+        "sort:",
+        "numberofresults",
+        "entrydate",  # card export column header
+        "transactionvaluedate",
+        "transactiondatevaluedate",
+        "statementreference",
+        "currentbalance",
+        "cardaccount:",
+        "callaccount:",
+        "transactionalaccount:",
+        "printedon",
+        "entity:",
+        "downloadedon",
+        "contactus",
+        # Footer legal boilerplate wraps across several lines; each fragment
+        # needs its own marker or it merges into the next transaction.
+        "investeccorporate",
+        "aregisteredcreditprovider",
+        "codeofbanking",
+        "bankingpractice",
+        "ombudsmanforbanking",
+        "copiesofthecode",
+        "authorisedfinancial",
+        "overthecounter",
+        "memberofthejse",
+        "registrationnumber",
+        "visitinvestec",
+    )
+
+    def _th_is_skip(self, line: str) -> bool:
+        low = line.lower().replace(" ", "")
+        return any(m in low for m in self._TH_SKIP_MARKERS)
+
+    def _th_split(self, line: str):
+        """Locate the financial fields on a Business Online line.
+
+        Returns ``(dates, txn_match, balance_match)`` or None. The transaction
+        amount and running balance are always the rightmost two ``R``-amounts;
+        the entry/value dates are the slash-dates to the left of them.
+        """
+        amts = list(self.TH_AMOUNT_PATTERN.finditer(line))
+        if len(amts) < 2:
+            return None
+        txn, balance = amts[-2], amts[-1]
+        dates = [
+            d for d in self.DATE_PATTERN_SLASH.finditer(line)
+            if d.start() < txn.start()
+        ]
+        if not dates:
+            return None
+        return dates, txn, balance
+
+    def _th_is_dated(self, line: str) -> bool:
+        """Whether a line is a transaction row (starts with a date + has amounts)."""
+        return bool(
+            self.DATE_PATTERN_SLASH.match(line.strip())
+            and self._th_split(line)
+        )
+
+    def _th_has_inline_desc(self, line: str) -> bool:
+        split = self._th_split(line)
+        if not split:
+            return False
+        dates, txn, _ = split
+        return len(line[dates[-1].end():txn.start()].strip()) > 0
+
+    def _iter_th_lines(self):
+        """Merge the export into one string per transaction.
+
+        Descriptions (and the card-holder column) wrap onto the lines above
+        and below the dated line. Same prefix/suffix heuristic as
+        ``_merge_multiline``: a dated line that already carries an inline
+        description leaves trailing undated lines to the next transaction;
+        otherwise it absorbs them as a suffix.
+        """
+        clean = []
+        for text in self._get_page_texts():
+            for raw in text.split("\n"):
+                line = raw.strip()
+                if line and not self._th_is_skip(line):
+                    clean.append(line)
+
+        merged = []
+        i, n = 0, len(clean)
+        while i < n:
+            line = clean[i]
+            if self._th_is_dated(line):
+                combined = line
+                if not self._th_has_inline_desc(line):
+                    while i + 1 < n and not self._th_is_dated(clean[i + 1]):
+                        i += 1
+                        combined += " " + clean[i]
+                merged.append(combined)
+            else:
+                prefix = line
+                while i + 1 < n and not self._th_is_dated(clean[i + 1]):
+                    i += 1
+                    prefix += " " + clean[i]
+                if i + 1 < n:
+                    i += 1
+                    dated = clean[i]
+                    combined = prefix + " " + dated
+                    if not self._th_has_inline_desc(dated):
+                        while i + 1 < n and not self._th_is_dated(clean[i + 1]):
+                            i += 1
+                            combined += " " + clean[i]
+                    merged.append(combined)
+            i += 1
+        return merged
+
+    def _parse_th_line(self, line: str) -> dict | None:
+        """Parse one merged Business Online transaction string into a row."""
+        split = self._th_split(line)
+        if not split:
+            return None
+        dates, txn, bal = split
+        d0 = dates[0]
+        date_str = f"{d0.group(1)}/{d0.group(2)}/{d0.group(3)}"
+
+        prefix_desc = line[:d0.start()].strip()
+        inline_desc = line[dates[-1].end():txn.start()].strip()
+        suffix_desc = line[bal.end():].strip()
+        description = re.sub(
+            r"\s+", " ",
+            " ".join(p for p in (prefix_desc, inline_desc, suffix_desc) if p),
+        ).strip()
+
+        amount = self._clean_amount(txn.group(2))
+        balance = self._clean_amount(bal.group(2))
+        if bal.group(1) is not None:
+            balance = -balance
+
+        is_debit = txn.group(1) is not None
+        debit = amount if is_debit else 0.0
+        credit = 0.0 if is_debit else amount
+        return create_transaction_row(date_str, description, debit, credit, balance)
+
+    def _extract_th_transactions(self) -> pd.DataFrame:
+        """Extract a Business Online export, restored to chronological order.
+
+        The export is sorted most-recent-first, so the rows are reversed to
+        oldest-first before returning — the running-balance chain (and the
+        verification oracle) both read top-to-bottom.
+        """
+        rows = [
+            row for line in self._iter_th_lines()
+            if (row := self._parse_th_line(line))
+        ]
+        rows.reverse()
+        return pd.DataFrame(rows)
+
+    def _iter_transaction_lines(self):
+        """Yield transaction text lines from the PDF, routed by layout.
+
+        Business statements prefer pdfplumber table extraction (which groups
+        wrapped descriptions); corporate-card and call-deposit statements keep
+        all data in the page text and are parsed directly, since spurious
+        watermark "tables" would otherwise shadow the real transactions.
+        """
+        fmt = self._detect_statement_format()
+
+        if fmt == "corporate_card":
+            yield from self._iter_corporate_card_lines()
+            return
+
+        if fmt == "call_deposit":
+            for text in self._get_page_texts():
+                if not text:
+                    continue
+                for line in self._merge_multiline(text.split("\n")):
+                    yield line
+            return
+
+        # business: table-preferred, ignoring spurious tables and falling
+        # back to text per-page when a page yields no real transaction rows.
         with pdfplumber.open(self.pdf_file) as pdf:
             for page in pdf.pages:
-                tables = page.extract_tables()
-                if tables:
-                    for table in tables:
-                        for row in table:
-                            if not row or not row[0]:
-                                continue
-                            cell = row[0].replace("\n", " ").strip()
-                            # Skip table header rows
-                            low = cell.lower().replace(" ", "")
-                            if "transactiondate" in low or "transdate" in low:
-                                continue
-                            if cell:
-                                yield cell
-                else:
+                yielded_any = False
+                for table in page.extract_tables() or []:
+                    for row in table:
+                        if not row or not row[0]:
+                            continue
+                        cell = row[0].replace("\n", " ").strip()
+                        low = cell.lower().replace(" ", "")
+                        if "transactiondate" in low or "transdate" in low:
+                            continue
+                        if self._looks_like_transaction(cell):
+                            yielded_any = True
+                            yield cell
+                if not yielded_any:
                     text = page.extract_text()
                     if text:
-                        merged = self._merge_multiline(text.split("\n"))
-                        for line in merged:
+                        for line in self._merge_multiline(text.split("\n")):
                             yield line
 
         self._reset_file()
 
     def extract_transactions(self) -> pd.DataFrame:
         """Extract transactions from Investec statement."""
+        fmt = self._detect_statement_format()
+        if fmt == "th_export":
+            return self._extract_th_transactions()
+
         rows = []
+        parse_line = (
+            self._parse_card_line
+            if fmt == "corporate_card"
+            else self._parse_transaction_line
+        )
         for line in self._iter_transaction_lines():
-            txn = self._parse_transaction_line(line, rows)
+            txn = parse_line(line, rows)
             if txn:
                 rows.append(txn)
         if rows:
