@@ -55,7 +55,9 @@ app.add_middleware(
 # Resource limits — the API runs on a 1GB instance, so every ingress path is
 # size-capped and heavy work is serialized through a single semaphore slot.
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(30 * 1024 * 1024)))
-MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", "20"))
+# 0 (the default) means no per-request file cap. Set a positive
+# MAX_FILES_PER_REQUEST to re-impose a limit (e.g. on a small hosting instance).
+MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", "0"))
 MAX_JSON_UPLOAD_BYTES = int(os.getenv("MAX_JSON_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(100 * 1024 * 1024)))
 
@@ -387,6 +389,23 @@ def _deduplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _account_source(bank_name: str, account_number) -> str:
+    """Build the per-account identity used as the ``Source`` grouping key.
+
+    ``Source`` drives the account count (``calculate_coverage``), per-account
+    balance-chain verification (``_verify_grouped_results``) and dedup
+    partitioning (``_deduplicate_transactions``). Keying on the bank name alone
+    collapses every account at one bank into a single "account", so distinct
+    accounts must carry distinct identities. Parsers return a deterministic
+    account number per account, so no normalisation is needed; a missing number
+    falls back to the bank name (best effort — the bank's accounts can't be
+    told apart without one).
+    """
+    if account_number:
+        return f"{bank_name} ({str(account_number).strip()})"
+    return bank_name
+
+
 async def process_single_url(url: str, raise_on_error: bool = True) -> dict:
     """Download a PDF from a URL (streamed to disk, size-capped) and parse it."""
     filename = unquote(url.split("/")[-1].split("?")[0])
@@ -462,7 +481,8 @@ def _parse_links_field(links: Optional[str]) -> List[str]:
 
 
 def _check_file_count(total_count: int) -> None:
-    if total_count > MAX_FILES_PER_REQUEST:
+    # A non-positive limit disables the cap entirely (unlimited files).
+    if MAX_FILES_PER_REQUEST > 0 and total_count > MAX_FILES_PER_REQUEST:
         raise HTTPException(
             status_code=413,
             detail=f"Too many files (max {MAX_FILES_PER_REQUEST} per request).",
@@ -490,7 +510,9 @@ def _build_parse_zip_sync(results: list, errors: list, timestamp: str) -> io.Byt
             )
             result["df"] = None
             verification_results.append(vr)
-            corrected_df["Source"] = result["bank_name"]
+            corrected_df["Source"] = _account_source(
+                result["bank_name"], result.get("account_number")
+            )
             all_dfs.append(corrected_df)
 
             v_filename = Path(result["filename"]).stem + ".verification.json"
@@ -666,7 +688,9 @@ def _build_parse_json_sync(all_results: list, total_count: int) -> dict:
             )
             result["df"] = None
             verification_results.append(vr.to_dict())
-            corrected_df["Source"] = result["bank_name"]
+            corrected_df["Source"] = _account_source(
+                result["bank_name"], result.get("account_number")
+            )
             all_dfs.append(corrected_df)
 
     if not all_dfs:
@@ -858,7 +882,9 @@ def _build_full_prevet_sync(
                 )
                 result["df"] = None
                 verification_results.append(vr)
-                corrected_df["Source"] = result["bank_name"]
+                corrected_df["Source"] = _account_source(
+                    result["bank_name"], result.get("account_number")
+                )
                 all_dfs.append(corrected_df)
 
             combined_df = _standardize_dataframe(

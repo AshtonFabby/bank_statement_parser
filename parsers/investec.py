@@ -235,27 +235,30 @@ class InvestecParser(BaseBankParser):
         account_number = None
         account_type = None
 
-        # Prefer the customer-facing account number (not internal).
-        # e.g. "Accountnumber 40005077141" rather than
-        # "Internalaccountnumber 1300597865580".
-        matches = re.finditer(
-            r"(?<!\S)(?:Internal\s*)?[Aa]ccount\s*number\s*(\d+)",
-            first_page, re.IGNORECASE
-        )
-        for m in matches:
-            is_internal = "internal" in m.group(0).lower()
-            value = m.group(1)
-            if is_internal:
+        # Return the customer-facing "Account number", never an "Internal" or
+        # "Electronic" alias printed alongside it. A statement identifies one
+        # real account by several numbers (e.g. the call-deposit account prints
+        # "Account number 1100597029500" and "Electronic account number
+        # 50019941900"); grouping needs a single, deterministic value per
+        # account. The optional prefix group is captured so aliases can be
+        # detected on both spaced ("Electronic account number") and squished
+        # ("Electronicaccountnumber") text — the old (?<!\S) guard silently
+        # failed on the squished form, splitting one account across statements.
+        fallback = None
+        for m in re.finditer(
+            r"(internal|electronic)?\s*account\s*number\s*:?\s*(\d{6,})",
+            first_page, re.IGNORECASE,
+        ):
+            is_alias = m.group(1) is not None
+            value = m.group(2)
+            if is_alias:
+                fallback = fallback or value
                 continue
-            if account_number is None or len(value) >= 10:
-                account_number = value
+            account_number = value
+            break
 
         if account_number is None:
-            acc_match = re.search(
-                r"[Aa]ccount\s*number\s*(\d{6,})", first_page, re.IGNORECASE
-            )
-            if acc_match:
-                account_number = acc_match.group(1)
+            account_number = fallback
 
         if "private bank" in first_page.lower():
             account_type = "Private Bank Account"

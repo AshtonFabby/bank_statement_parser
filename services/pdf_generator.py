@@ -279,6 +279,31 @@ def generate_summary_pdf(
         coverage_table.setStyle(_green_table_style())
         elements.append(RoundedTable(coverage_table))
 
+    # ── Accounts Detected ─────────────────────────────────────────────────
+    # Lists the distinct accounts behind "Number of Accounts Detected" above.
+    # The Source column carries each account's identity as "Bank (number)"
+    # (see main._account_source); split it back out for a two-column table.
+    if "Source" in df.columns:
+        seen = []
+        for src in df["Source"].dropna():
+            if src not in seen:
+                seen.append(src)
+        if seen:
+            elements.append(Paragraph("ACCOUNTS DETECTED", section_style))
+            accounts_data = [["Bank", "Account Number"]]
+            for src in seen:
+                text = str(src)
+                if text.endswith(")") and " (" in text:
+                    bank, number = text.rsplit(" (", 1)
+                    number = number[:-1]
+                else:
+                    bank, number = text, "N/A"
+                accounts_data.append([bank, number])
+
+            accounts_table = Table(accounts_data, colWidths=[3 * inch, 3 * inch])
+            accounts_table.setStyle(_green_table_style())
+            elements.append(RoundedTable(accounts_table))
+
     # ── Activity Volume ───────────────────────────────────────────────────
     if activity:
         elements.append(Paragraph("ACTIVITY VOLUME", section_style))
