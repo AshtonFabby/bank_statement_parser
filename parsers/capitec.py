@@ -38,35 +38,90 @@ class CapitecParser(BaseBankParser):
     # Single short date pattern for table cell matching
     SHORT_DATE_CELL = re.compile(r"^\d{2}/\d{2}/\d{2}$")
 
+    # Account-number patterns. These are deliberately anchored to an explicit
+    # label: transaction rows routinely wrap the bare word "ACCOUNT" onto a
+    # line of its own next to a long reference number (e.g. a payment out to
+    # "...FNB CAPITEC ACCOUNT To 63201624665250655", or a SWIFT reference
+    # "STP Inw Pmt I/W SWFA INTN: 45349838"), and an unanchored search picks
+    # those up as the account number. A wrong number here does not just
+    # mislabel the statement — it splits one account into several "Source"
+    # groups downstream, inflating the account count and breaking the
+    # per-account balance chain.
+    ACCOUNT_LABELLED = re.compile(
+        r"account\s*(?:no\.?|number|nr\.?)\s*[:.]?\s*(\d{7,12})\b", re.IGNORECASE
+    )
+    # Newer Tax Invoice layout: "Account: Capitec Business Account 1054899320"
+    ACCOUNT_COLON = re.compile(
+        r"\baccount\s*:\s*[^\d]*?(\d{7,12})\b", re.IGNORECASE
+    )
+    # Label alone on its line, number on the next
+    ACCOUNT_LABEL_ONLY = re.compile(
+        r"account\s*(?:no\.?|number|nr\.?)\s*[:.]?\s*$", re.IGNORECASE
+    )
+    ACCOUNT_DIGITS = re.compile(r"\b(\d{7,12})\b")
+    ACCOUNT_TYPE_INLINE = re.compile(r"account\s*type\s+(.+)", re.IGNORECASE)
+    ACCOUNT_TYPE_COLON = re.compile(
+        r"\baccount\s*:\s*(.+?)\s+\d{7,12}\b", re.IGNORECASE
+    )
+    # Start of the transaction table — everything below it is data, not header.
+    # The date alternatives require a second date or a non-digit after them so
+    # the standalone print-date line near the top of the header ("27/03/2026")
+    # doesn't end the header region before the account number appears.
+    HEADER_STOP = re.compile(
+        r"^(?:post\s+trans"
+        r"|date\s+description"
+        r"|transaction history"
+        r"|balance brought forward"
+        r"|balance b/forward"
+        r"|opening balance"
+        r"|\d{2}/\d{2}/\d{2}\s+\d{2}/\d{2}/\d{2}\s"
+        r"|\d{2}/\d{2}/\d{4}\s+\D)",
+        re.IGNORECASE,
+    )
+
+    def _header_lines(self, page_text: str) -> list[str]:
+        """Return the page-1 lines above the transaction table."""
+        header = []
+        for line in page_text.split("\n"):
+            if self.HEADER_STOP.match(line.strip()):
+                break
+            header.append(line)
+        return header
+
     def extract_account_info(self) -> AccountInfo:
-        """Extract account info from Capitec statement."""
-        first_page = self._extract_first_page_text()
+        """Extract account info from Capitec statement.
+
+        Only explicitly labelled account numbers are accepted, and the first
+        match wins — see ACCOUNT_LABELLED for why anything looser misreads
+        transaction references as the account number. When no labelled number
+        is present the account number is left as None, which merges the
+        statement under the bank name rather than inventing an account.
+        """
+        lines = self._header_lines(self._extract_first_page_text())
         account_number = None
         account_type = None
 
-        lines = first_page.split("\n")
         for i, line in enumerate(lines):
-            line_lower = line.lower().strip()
-
-            # Look for "Account No.", "Account number", or bare "Account [number]"
-            if "account type" not in line_lower and "account holder" not in line_lower:
-                if "account no" in line_lower or "account number" in line_lower or "account" in line_lower:
-                    match = re.search(r"\d{7,12}", line)
+            if account_number is None:
+                match = self.ACCOUNT_LABELLED.search(line) or self.ACCOUNT_COLON.search(
+                    line
+                )
+                if match:
+                    account_number = match.group(1)
+                elif self.ACCOUNT_LABEL_ONLY.search(line.strip()) and i + 1 < len(lines):
+                    match = self.ACCOUNT_DIGITS.search(lines[i + 1])
                     if match:
-                        account_number = match.group()
-                    elif i + 1 < len(lines):
-                        match = re.search(r"\d{7,12}", lines[i + 1])
-                        if match:
-                            account_number = match.group()
+                        account_number = match.group(1)
 
-            # Look for account type
-            if "account type" in line_lower:
-                # Extract text after "Account type"
-                type_match = re.search(r"account\s*type\s+(.+)", line, re.IGNORECASE)
-                if type_match:
-                    account_type = type_match.group(1).strip()
-                elif i + 1 < len(lines):
-                    account_type = lines[i + 1].strip()
+            if account_type is None:
+                match = self.ACCOUNT_TYPE_INLINE.search(
+                    line
+                ) or self.ACCOUNT_TYPE_COLON.search(line)
+                if match:
+                    account_type = match.group(1).strip()
+
+            if account_number and account_type:
+                break
 
         return AccountInfo(
             bank=self.BANK_NAME,
