@@ -19,6 +19,15 @@ class ABSAParser(BaseBankParser):
         ("transaction history", 3),
         ("business bank esp", 10),
         ("bio case", 10),
+        # The Business Integrator report also ships as a browser print-to-PDF,
+        # whose page title is "Statement Enquiry" — the exact phrase Nedbank
+        # claims at weight 10 for its own export. That rendering carries no
+        # ABSA branding in the letterhead, so without a counterweight an ABSA
+        # statement routes to Nedbank. "BALANCE B/FORWARD" is the ABSA
+        # mainframe's opening-row wording, present once in the identity zone
+        # of every BIO rendering and absent from Nedbank's layout, so it
+        # settles the tie without weakening Nedbank's own keyword.
+        ("balance b/forward", 12),
     ]
 
     # Date patterns - ABSA uses multiple formats
@@ -41,6 +50,37 @@ class ABSAParser(BaseBankParser):
         re.IGNORECASE,
     )
     BIZSTART_AMOUNT_PATTERN = re.compile(r"\d{1,3}(?:\s\d{3})*,\d{2}-?")
+    # Trailing value of the BIO "Site" column, which text extraction runs onto
+    # the end of the description.
+    BIO_SITE_SUFFIX = (
+        r"\s+(SETTLEMENT|HEADOFFICE|CF|RASC|BALLI|DURBA|CINGSTANG|UMHLA|CN)\s*$"
+    )
+    # Business Integrator page furniture: the letterhead, column headers and
+    # footers that repeat on every page. This has to be an explicit list
+    # because a BIO description wraps onto bare continuation lines carrying no
+    # date or amount ("CPT", "00094836471", "FLAMINGO Boksb"), so "line that
+    # does not look like a transaction" cannot distinguish chrome from data —
+    # anything not matched here is treated as description text. Both
+    # renderings are covered: the JasperReports export ("BIO CASE", "Page n of
+    # m") and the browser print ("Statement Enquiry", "about:blank n/m").
+    BIO_NOISE_PATTERN = re.compile(
+        r"""(?ix)
+          ^(?: Entry | Event | Number | No | AM | PM | - )$
+        | ^BIO\s+CASE\b
+        | ^Account\s
+        | ^Branch\s
+        | ^Entry\s+(?:Event|Number)\b
+        | ^(?:No\s+)?Date\s+Description(?:\s+Site\s+Amount\s+Balance)?$
+        | ^\d{4}-\d{2}-\d{2}$
+        | ^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),
+        | ^Start\s+Date\b
+        | ^Statement\s+Enquiry$
+        | ^\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?$
+        | about:blank
+        | ^Page\s+\d+\s+of\s+\d+$
+        | ^\d+\s*/\s*\d+$
+        """
+    )
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from ABSA statement."""
@@ -61,6 +101,22 @@ class ABSAParser(BaseBankParser):
         if not account_number:
             acc_match = re.search(
                 r"(?:ABSA|Account)\s*[\n\s]*(\d{10,12})",
+                first_page,
+                re.IGNORECASE,
+            )
+            if acc_match:
+                account_number = acc_match.group(1)
+
+        # Business Integrator browser print: the header puts the account name
+        # first and the number last —
+        #   "Account PIGMENTS AND MASTERBATCHES JHB (PTY) LTD - 4096212091 Branch EASTGATE"
+        # — the reverse of the JasperReports rendering ("Account 4096212091 -
+        # PIGMENTS ..."), which the pattern above already handles. The lazy
+        # quantifier keeps this from firing on that rendering, where nothing
+        # follows the dash but the name.
+        if not account_number:
+            acc_match = re.search(
+                r"Account\s+.*?-\s*(\d{10,12})\b",
                 first_page,
                 re.IGNORECASE,
             )
@@ -100,7 +156,9 @@ class ABSAParser(BaseBankParser):
                 account_number = th_match2.group(1)
 
         # Get account type
-        if "bizstart" in first_page.lower():
+        if self._detect_format(first_page) == "business_integrator":
+            account_type = "Business Integrator"
+        elif "bizstart" in first_page.lower():
             account_type = "BizStart"
         elif "cheque account" in first_page.lower():
             account_type = "Cheque Account"
@@ -135,10 +193,24 @@ class ABSAParser(BaseBankParser):
         # Cheque account statement format - explicit header check
         if "Cheque account statement" in text:
             return "cheque_statement"
-        # Business Integrator format uses YYMMDD dates (e.g., 250901) with entry numbers
-        # Pattern: entry number (4+ digits) + space + YYMMDD date + space
-        # Must also contain "BIO CASE" to avoid false positives
-        if re.search(r"^\d{4}\s+\d{6}\s+", text, re.MULTILINE) and "BIO CASE" in text:
+        # Business Integrator format uses YYMMDD dates (e.g., 250901) with entry
+        # numbers. Pattern: entry number + space + YYMMDD date + space.
+        #
+        # The entry number is a running sequence that widens over an account's
+        # life, so its width cannot be pinned: anchoring on exactly four digits
+        # matched "1927 250901" but not "49883 260301" (\d{4} consumes "4988"
+        # and \s then fails against "3"), silently dropping every statement
+        # from a client whose sequence had rolled over to five digits. The
+        # opening row is numbered "00", hence 2 as the floor — the same
+        # widening entry_date_pattern already applies in the extractor.
+        #
+        # The marker is gated to avoid false positives, but the report ships in
+        # two renderings and only the JasperReports one prints "BIO CASE"; the
+        # browser print-to-PDF identifies itself as "Statement Enquiry" and is
+        # recognised by its opening row instead.
+        if re.search(r"^\d{2,}\s+\d{6}\s+", text, re.MULTILINE) and (
+            "BIO CASE" in text or "BALANCE B/FORWARD" in text
+        ):
             return "business_integrator"
         # BizStart format uses "D Mon YYYY" dates and comma-decimal amounts
         if re.search(
@@ -402,21 +474,8 @@ class ABSAParser(BaseBankParser):
                 if not line:
                     continue
 
-                # Skip header lines
-                if "BIO CASE" in line:
-                    continue
-                if "Account 4113770534" in line or "Branch BUSINESS BANK ESP" in line:
-                    continue
-                if "Start Date" in line and "End Date" in line:
-                    continue
-                if re.match(r"^Entry\s+Event\s*$", line, re.IGNORECASE):
-                    continue
-                if "No Date Description Site Amount Balance" in line or \
-                   "No Date Description" in line:
-                    continue
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", line):  # Date line like 2025-10-06
-                    continue
-                if re.match(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun),", line):  # Timestamp line
+                # Skip the repeating page furniture (see BIO_NOISE_PATTERN)
+                if self.BIO_NOISE_PATTERN.search(line):
                     continue
 
                 # Check for transaction line with entry number + date
@@ -457,7 +516,7 @@ class ABSAParser(BaseBankParser):
                         description = rest[:first_amt_match.start()].strip() if first_amt_match else rest
 
                         # Remove site indicators from end of description
-                        description = re.sub(r"\s+(SETTLEMENT|HEADOFFICE|CF|RASC|BALLI|DURBA|CINGSTANG|UMHLA|CN)\s*$", "", description).strip()
+                        description = re.sub(self.BIO_SITE_SUFFIX, "", description).strip()
 
                         debit = 0.0
                         credit = 0.0
@@ -509,6 +568,21 @@ class ABSAParser(BaseBankParser):
                     else:
                         # Just more description text
                         pending_transaction["Description"] += " " + line
+                    continue
+
+                # A wrap line with no pending transaction belongs to the row
+                # that was just completed: a BIO description that overflows its
+                # column continues on the next line, and a transaction whose
+                # amounts all landed on the first line leaves nothing pending.
+                # Dropping these silently cost real reference data — a
+                # "POS PURCHASE ... UBER" lost its "CPT", and an
+                # "INT DEBIT ORDER TO ABSA VF" lost account "00094836471".
+                if rows:
+                    extra = re.sub(self.BIO_SITE_SUFFIX, "", line).strip()
+                    if extra:
+                        rows[-1]["Description"] = (
+                            f"{rows[-1]['Description']} {extra}".strip()
+                        )
 
             # End of page - save any pending transaction
             if pending_transaction is not None:

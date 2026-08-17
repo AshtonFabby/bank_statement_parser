@@ -71,6 +71,21 @@ CORPUS = {
         "ABSA/2. Oct.pdf",
         "ABSA/4. 25 Dec - 31Dec.pdf",
         "ABSA/6. Feb.pdf",
+        # Five-digit entry numbers. The format gate was anchored on exactly
+        # four, so a client whose running sequence had rolled over parsed to
+        # zero rows while the older files above kept passing.
+        "ABSA/2. Mar - BIO.pdf",
+        "ABSA/6. Jul - BIO.pdf",
+    ]),
+    # The same Business Integrator report printed from the browser rather than
+    # exported by JasperReports. It is a distinct family, not a rendering
+    # detail: it drops the "BIO CASE" marker, reverses the account header to
+    # name-first, and titles itself "Statement Enquiry" — the phrase Nedbank
+    # claims for its own export, which used to win detection outright.
+    "ABSA/bio-print": ("absa", "TH", [
+        "ABSA/1. Feb - BIO.pdf",
+        "ABSA/3. Apr - BIO.pdf",
+        "ABSA/7. TH - BIO.pdf",
     ]),
     "Capitec/statement": ("capitec", "BS", [
         "Capitec/1. Jun.pdf",

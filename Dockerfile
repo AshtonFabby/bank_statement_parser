@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+# Copy the official uv binary
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 WORKDIR /app
 
 # Install system dependencies for pdfplumber and OCR (tesseract).
@@ -12,10 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+ENV UV_COMPILE_BYTECODE=1
+ENV PATH="/app/.venv/bin:$PATH"
 
-COPY requirements.txt .
-
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies using uv lockfile for fast, cached layer builds
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev
 
 COPY . .
 
