@@ -97,10 +97,25 @@ class BaseBankParser(ABC):
         if self._page_texts_cache is None:
             import pdfplumber
             texts = []
-            with pdfplumber.open(self.pdf_file) as pdf:
-                for page in pdf.pages:
-                    texts.append(page.extract_text() or "")
-                    page.flush_cache()
+            try:
+                with pdfplumber.open(self.pdf_file) as pdf:
+                    for page in pdf.pages:
+                        texts.append(page.extract_text() or "")
+                        page.flush_cache()
+            except Exception as pdfplumber_error:
+                # A few bank portals emit PDFs that render correctly in PDF
+                # viewers but have incomplete xref/catalog metadata. PyMuPDF
+                # can recover those documents, while pdfplumber/pdfminer
+                # rejects them before it can extract any text.
+                try:
+                    import pymupdf
+
+                    self.pdf_file.seek(0)
+                    pdf_bytes = self.pdf_file.read()
+                    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as pdf:
+                        texts = [page.get_text() or "" for page in pdf]
+                except Exception:
+                    raise pdfplumber_error
             self._reset_file()
             self._page_texts_cache = texts
         return self._page_texts_cache
