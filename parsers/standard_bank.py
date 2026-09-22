@@ -52,6 +52,14 @@ class StandardBankParser(BaseBankParser):
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Standard Bank statement."""
         first_page = self._extract_first_page_text()
+        if self._detect_format() == "regular_trailing_fees":
+            # The address occupies the right half of the same header lines.
+            import pdfplumber
+
+            with pdfplumber.open(self.pdf_file) as pdf:
+                page = pdf.pages[0]
+                first_page = page.crop((0, 0, page.width / 2, page.height)).extract_text() or ""
+            self._reset_file()
         account_number = None
         account_type = None
 
@@ -163,6 +171,9 @@ class StandardBankParser(BaseBankParser):
     def _detect_format(self) -> str:
         """Detect which Standard Bank statement format this is."""
         first_page = self._extract_first_page_text()
+
+        if re.search(r"Payments\s+Deposits\s+Bank fees\s+Balance", first_page, re.IGNORECASE):
+            return "regular_trailing_fees"
 
         # Regular statement with Fees column
         if re.search(r"Fees.*Payments.*Deposits.*Balance", first_page, re.DOTALL | re.IGNORECASE):
@@ -754,9 +765,76 @@ class StandardBankParser(BaseBankParser):
             df = self._extract_transactions_current_account()
         elif fmt == "regular_with_fees":
             df = self._extract_transactions_regular_with_fees()
+        elif fmt == "regular_trailing_fees":
+            df = self._extract_transactions_trailing_fees()
         else:
             df = self._extract_transactions_regular()
         return self._normalise_chronological_order(df)
+
+    def _extract_transactions_trailing_fees(self) -> pd.DataFrame:
+        """Read Payments/Deposits/Bank fees by position, excluding fee annotations.
+
+        The fee column does not change the row's balance; actual fee debits
+        appear separately. Description references can contain currency amounts,
+        so counting numeric tokens in flattened text cannot identify columns.
+        """
+        import pdfplumber
+
+        rows = []
+        with pdfplumber.open(self.pdf_file) as pdf:
+            for page in pdf.pages:
+                lines = page.extract_text_lines(keep_blank_chars=True)
+                header = next((line for line in lines if re.search(
+                    r"Date\s+Description\s+Payments\s+Deposits\s+Bank fees\s+Balance",
+                    line["text"], re.IGNORECASE,
+                )), None)
+                if header is None:
+                    raise ValueError("Missing Standard Bank transaction columns")
+                words = page.extract_words()
+                headings = {w["text"]: w for w in words
+                            if abs(w["top"] - header["top"]) < 3}
+                # Numeric headings and amounts share right edges. A long
+                # balance starts to the left of the word "Balance" itself.
+                payment_edge = headings["Payments"]["x1"]
+                deposit_edge = headings["Deposits"]["x1"]
+                boundaries = [headings["Description"]["x0"] - 5,
+                              payment_edge - (deposit_edge - payment_edge) + 2,
+                              payment_edge + 2, deposit_edge + 2,
+                              headings["fees"]["x1"] + 2]
+                current = None
+                for line in lines:
+                    if line["top"] <= header["bottom"]:
+                        continue
+                    text = line["text"]
+                    if text.startswith(("The Standard Bank", "We subscribe", "Please verify", "Statement Summary")):
+                        break
+                    cells = [[] for _ in range(6)]
+                    for char in line["chars"]:
+                        column = sum(char["x0"] >= edge for edge in boundaries)
+                        cells[column].append(char)
+                    cells = ["".join(char["text"] for char in cell).strip() if cell else ""
+                             for cell in cells]
+                    if "STATEMENT OPENING BALANCE" in cells[1].upper():
+                        rows.append(create_transaction_row(
+                            "", "Statement Opening Balance", 0.0, 0.0,
+                            self._clean_amount(cells[5]),
+                        ))
+                        continue
+                    match = self.DATE_PATTERN.match(cells[0])
+                    if match:
+                        day, month, year = match.groups()
+                        current = create_transaction_row(
+                            f"{day.zfill(2)}/{MONTH_MAP[month.lower()]}/20{year}",
+                            cells[1], abs(self._clean_amount(cells[2])) if cells[2] else 0.0,
+                            abs(self._clean_amount(cells[3])) if cells[3] else 0.0,
+                            self._clean_amount(cells[5]),
+                        )
+                        rows.append(current)
+                    elif current is not None and cells[1] and not cells[0] and not any(cells[2:]):
+                        current["Description"] += " " + cells[1]
+                page.flush_cache()
+        self._reset_file()
+        return pd.DataFrame(rows)
 
     @staticmethod
     def _normalise_chronological_order(df: pd.DataFrame) -> pd.DataFrame:
