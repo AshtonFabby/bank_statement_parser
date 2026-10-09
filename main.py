@@ -358,8 +358,13 @@ def _verify_grouped_results(
 
 
 def _deduplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove duplicate transactions that arise when a bank statement and transaction
-    history overlap in date range.  Two rows are considered duplicates when they share
+    """Remove overlapping entries while keeping genuine repeated transactions.
+
+    Uploads supply an internal ``_Document`` identifier in addition to their
+    account ``Source``. These match on account, date, amounts and balance,
+    since history exports can reword the same transaction's description.
+
+    Legacy records without that identifier match when they share
     the same Date, Description, Debit, and Credit values (Balance is intentionally
     excluded because it can differ between document types for the same transaction).
     The first occurrence is kept so bank-statement data takes precedence over
@@ -375,6 +380,21 @@ def _deduplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
     """
     key = ["Date", "Description", "Debit", "Credit"]
     working = df.copy()
+
+    if "_Document" in working.columns:
+        # Uploads carry separate document and account identities. The same
+        # ledger entry can have a differently worded reference in a history
+        # export, so match its date, amounts and balance within that account.
+        # Occurrence counts preserve genuine repetitions inside a document.
+        ledger_key = ["Source", "Date", "Debit", "Credit", "Balance"]
+        working["_occurrence"] = working.groupby(
+            ["_Document"] + ledger_key, dropna=False
+        ).cumcount()
+        return (
+            working.drop_duplicates(subset=ledger_key + ["_occurrence"], keep="first")
+            .drop(columns=["_occurrence", "_Document"])
+            .reset_index(drop=True)
+        )
 
     # Position of this row among identical rows *within its own document*.
     # Without a Source column the input is a single document, so every row
@@ -396,13 +416,16 @@ def _account_source(bank_name: str, account_number) -> str:
     balance-chain verification (``_verify_grouped_results``) and dedup
     partitioning (``_deduplicate_transactions``). Keying on the bank name alone
     collapses every account at one bank into a single "account", so distinct
-    accounts must carry distinct identities. Parsers return a deterministic
-    account number per account, so no normalisation is needed; a missing number
+    accounts must carry distinct identities. Standard Bank history exports pad
+    account numbers with zeros, unlike monthly statements; a missing number
     falls back to the bank name (best effort — the bank's accounts can't be
     told apart without one).
     """
     if account_number:
-        return f"{bank_name} ({str(account_number).strip()})"
+        number = str(account_number).strip()
+        if bank_name == "Standard Bank" and number.isdigit():
+            number = number.lstrip("0") or "0"
+        return f"{bank_name} ({number})"
     return bank_name
 
 
@@ -498,7 +521,7 @@ def _build_parse_zip_sync(results: list, errors: list, timestamp: str) -> io.Byt
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         all_dfs = []
         verification_results = []
-        for result in results:
+        for document_index, result in enumerate(results):
             corrected_df, vr = verify_and_correct(
                 result["df"],
                 filename=result["filename"],
@@ -513,6 +536,8 @@ def _build_parse_zip_sync(results: list, errors: list, timestamp: str) -> io.Byt
             corrected_df["Source"] = _account_source(
                 result["bank_name"], result.get("account_number")
             )
+            if result.get("account_number"):
+                corrected_df["_Document"] = document_index
             all_dfs.append(corrected_df)
 
             v_filename = Path(result["filename"]).stem + ".verification.json"
@@ -669,7 +694,7 @@ def _build_parse_json_sync(all_results: list, total_count: int) -> dict:
     all_dfs = []
     errors = []
     verification_results = []
-    for result in all_results:
+    for document_index, result in enumerate(all_results):
         if result["error"]:
             errors.append({"filename": result["filename"], "error": result["error"]})
             verification_results.append({
@@ -691,6 +716,8 @@ def _build_parse_json_sync(all_results: list, total_count: int) -> dict:
             corrected_df["Source"] = _account_source(
                 result["bank_name"], result.get("account_number")
             )
+            if result.get("account_number"):
+                corrected_df["_Document"] = document_index
             all_dfs.append(corrected_df)
 
     if not all_dfs:
@@ -870,7 +897,7 @@ def _build_full_prevet_sync(
         if results:
             all_dfs = []
             verification_results = []
-            for result in results:
+            for document_index, result in enumerate(results):
                 corrected_df, vr = verify_and_correct(
                     result["df"],
                     filename=result["filename"],
@@ -885,6 +912,8 @@ def _build_full_prevet_sync(
                 corrected_df["Source"] = _account_source(
                     result["bank_name"], result.get("account_number")
                 )
+                if result.get("account_number"):
+                    corrected_df["_Document"] = document_index
                 all_dfs.append(corrected_df)
 
             combined_df = _standardize_dataframe(

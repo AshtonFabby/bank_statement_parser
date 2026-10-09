@@ -3,7 +3,10 @@
 import logging
 import os
 import re
+import shutil
+import sys
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 
@@ -35,6 +38,33 @@ except ImportError:
 _TESSERACT_AVAILABLE: bool | None = None
 
 
+def _configure_tesseract_command() -> None:
+    """Find a Windows installation when the installer did not update PATH.
+
+    Respect an explicit command or PATH installation before checking the
+    standard per-machine and per-user installer locations.
+    """
+    command = os.getenv("TESSERACT_CMD")
+    if command:
+        pytesseract.pytesseract.tesseract_cmd = command
+        return
+    if (sys.platform != "win32"
+            or pytesseract.pytesseract.tesseract_cmd != "tesseract"
+            or shutil.which("tesseract")):
+        return
+    for variable, suffix in (
+        ("ProgramFiles", "Tesseract-OCR/tesseract.exe"),
+        ("ProgramFiles(x86)", "Tesseract-OCR/tesseract.exe"),
+        ("LOCALAPPDATA", "Programs/Tesseract-OCR/tesseract.exe"),
+    ):
+        base = os.getenv(variable)
+        if base:
+            candidate = Path(base) / suffix
+            if candidate.is_file():
+                pytesseract.pytesseract.tesseract_cmd = str(candidate)
+                return
+
+
 def _ocr_available() -> bool:
     """Whether OCR can actually run: wrapper importable AND binary present.
 
@@ -48,6 +78,7 @@ def _ocr_available() -> bool:
         return False
     if _TESSERACT_AVAILABLE is None:
         try:
+            _configure_tesseract_command()
             pytesseract.get_tesseract_version()
             _TESSERACT_AVAILABLE = True
         except Exception as e:

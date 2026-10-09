@@ -117,6 +117,43 @@ def test_year_resolver_falls_back_when_no_period_line():
     assert resolve(6) == "2024"
 
 
+@pytest.mark.parametrize("september", ["Sep", "Sept"])
+def test_history_keeps_september_before_october(september):
+    parser = StandardBankParser(io.BytesIO())
+    parser._page_texts_cache = [
+        "Transaction date range: 29 September 2026 - 01 October 2026\n"
+        "Date Reference In (R) Out (R) Bank fees (R) Balance (R)\n"
+        "01 Oct 2026 RECEIPT +200,00 300,00\n"
+        f"30 {september} 2026 FEE -50,00 100,00\n"
+        f"29 {september} 2026 RECEIPT +150,00 150,00\n"
+    ]
+    df = parser.extract_transactions()
+    assert df.Date.tolist() == ["29/09/2026", "30/09/2026", "01/10/2026"]
+    assert df.Balance.tolist() == [150, 100, 300]
+    assert df.Credit.tolist() == [150, 0, 200]
+    assert df.Debit.tolist() == [0, 50, 0]
+
+
+def test_history_keeps_long_reference_lines_above_and_below_date():
+    parser = StandardBankParser(io.BytesIO())
+    parser._page_texts_cache = [
+        "Transaction date range: 22 September 2026 - 23 September 2026\n"
+        "Date Reference In (R) Out (R) Bank fees (R) Balance (R)\n"
+        "SHOP CARD 1234 21 SEP - CHEQUE\n"
+        "23 Sept 2026 CARD PURCHASE SHOP CARD 1234 21 -100,00 900,00\n"
+        "SEP\n"
+        "POLICY REF OCT 260922 - INSURANCE\n"
+        "22 Sept 2026 -50,00 1 000,00\n"
+        "PREMIUM POLICY REF OCT 260922\n"
+        "# These fees are zero rated\nPlease verify all transactions\n"
+    ]
+    df = parser.extract_transactions()
+    assert df.Description.tolist() == [
+        "POLICY REF OCT 260922 - INSURANCE PREMIUM POLICY REF OCT 260922",
+        "SHOP CARD 1234 21 SEP - CHEQUE CARD PURCHASE SHOP CARD 1234 21 SEP",
+    ]
+
+
 @pytest.mark.parametrize("filename", ["2. Dec.pdf", "6. TH.pdf"])
 def test_newest_first_statements_now_reconcile(filename):
     """These scored 0.0% and 1.4% before normalisation."""

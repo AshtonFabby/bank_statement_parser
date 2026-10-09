@@ -14,9 +14,11 @@ from parsers import fnb
 
 
 @pytest.fixture(autouse=True)
-def reset_probe():
+def reset_probe(monkeypatch):
     """The probe caches process-wide; isolate each test."""
     fnb._TESSERACT_AVAILABLE = None
+    monkeypatch.setattr(fnb.pytesseract.pytesseract, "tesseract_cmd", "tesseract")
+    monkeypatch.delenv("TESSERACT_CMD", raising=False)
     yield
     fnb._TESSERACT_AVAILABLE = None
 
@@ -75,3 +77,33 @@ def test_probe_runs_only_once(monkeypatch):
         fnb._ocr_available()
 
     assert len(calls) == 1
+
+
+def test_finds_windows_installation_outside_path(monkeypatch, tmp_path):
+    command = tmp_path / "Tesseract-OCR" / "tesseract.exe"
+    command.parent.mkdir()
+    command.touch()
+    monkeypatch.setattr(fnb.sys, "platform", "win32")
+    monkeypatch.setattr(fnb.shutil, "which", lambda name: None)
+    monkeypatch.setenv("ProgramFiles", str(tmp_path))
+    fnb._configure_tesseract_command()
+    assert fnb.pytesseract.pytesseract.tesseract_cmd == str(command)
+
+
+def test_explicit_ocr_command_takes_precedence(monkeypatch):
+    monkeypatch.setenv("TESSERACT_CMD", "custom/tesseract.exe")
+    fnb._configure_tesseract_command()
+    assert fnb.pytesseract.pytesseract.tesseract_cmd == "custom/tesseract.exe"
+
+
+def test_existing_ocr_command_is_preserved(monkeypatch):
+    monkeypatch.setattr(fnb.pytesseract.pytesseract, "tesseract_cmd", "configured/tesseract")
+    fnb._configure_tesseract_command()
+    assert fnb.pytesseract.pytesseract.tesseract_cmd == "configured/tesseract"
+
+
+def test_path_installation_is_preferred(monkeypatch):
+    monkeypatch.setattr(fnb.sys, "platform", "win32")
+    monkeypatch.setattr(fnb.shutil, "which", lambda name: "path/tesseract.exe")
+    fnb._configure_tesseract_command()
+    assert fnb.pytesseract.pytesseract.tesseract_cmd == "tesseract"

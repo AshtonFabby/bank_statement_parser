@@ -37,6 +37,38 @@ def test_business_product_is_preserved_when_number_already_matched():
     assert account.account_type == "BUSINESS CURRENT ACCOUNT"
 
 
+def test_mymobiz_product_and_summary_are_preserved():
+    parser = statement("Balance at date of statement 120.00")
+    parser._page_texts_cache[0] = parser._page_texts_cache[0].replace("BUSINESS", "MYMOBIZ")
+    account = parser.extract_account_info()
+    assert account.account_type == "MYMOBIZ CURRENT ACCOUNT"
+    assert account.declared_totals.closing_balance == 120
+
+
+@pytest.mark.parametrize("footer", [
+    "Please verify all transactions reflected on this statement",
+    "Please visit our website at www.standardbank.co.za",
+    "The Standard Bank of South Africa Limited",
+    "## These fees include VAT at 15%.",
+])
+def test_page_footer_excluded_but_next_page_reference_preserved(footer):
+    parser = statement()
+    parser._page_texts_cache = [
+        parser._page_texts_cache[0].split("SUPPLIER REFERENCE")[0]
+        + footer + "\nLegal information\n",
+        "Details Service Date Balance\nDebits Credits\nFee\n"
+        "BALANCE BROUGHT FORWARD 120.00\n"
+        "SUPPLIER REFERENCE\n"
+        "PAYMENT 10.00- 01 17 110.00\n"
+        "BENEFICIARY\n" + footer + "\nLegal information\n",
+    ]
+    df = parser.extract_transactions()
+    assert df.Description.tolist()[-2:] == [
+        "IB PAYMENT TO SUPPLIER REFERENCE", "PAYMENT BENEFICIARY",
+    ]
+    assert df.Balance.tolist() == [100, 150, 120, 110]
+
+
 @pytest.mark.parametrize("label,amount,expected", [
     ("available", "1,234.56", 1234.56),
     ("outstanding", "-1,234.56", -1234.56),

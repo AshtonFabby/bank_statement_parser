@@ -7,9 +7,19 @@ genuinely happened twice on one day must not be collapsed into one.
 
 import pandas as pd
 
-from main import _deduplicate_transactions
+from main import _account_source, _build_parse_json_sync, _deduplicate_transactions
 
 COLS = ["Date", "Description", "Debit", "Credit", "Balance", "Source"]
+
+
+def test_standard_bank_padded_history_number_groups_with_monthly_statement():
+    assert _account_source("Standard Bank", "0000012345678901") == _account_source(
+        "Standard Bank", "12345678901"
+    )
+    assert _account_source("Standard Bank", "12345678902") != _account_source(
+        "Standard Bank", "12345678901"
+    )
+    assert _account_source("FNB", "00123456789") == "FNB (00123456789)"
 
 
 def _df(rows):
@@ -89,3 +99,48 @@ def test_does_not_mutate_the_input_frame():
     before = df.copy()
     _deduplicate_transactions(df)
     pd.testing.assert_frame_equal(df, before)
+
+
+def test_upload_overlap_matches_ledger_despite_reference_wording():
+    df = _df([
+        ["22/09/2026", "CREDIT TRANSFER CUSTOMER", 0, 2000, 5000, "Standard Bank (123)"],
+        ["22/09/2026", "CUSTOMER - CREDIT TRANSFER CUSTOMER", 0, 2000, 5000, "Standard Bank (123)"],
+        ["22/09/2026", "CREDIT TRANSFER CUSTOMER", 0, 2000, 5000, "Standard Bank (456)"],
+    ])
+    df["_Document"] = [0, 1, 2]
+    out = _deduplicate_transactions(df)
+    assert len(out) == 2
+    assert out.Source.tolist() == ["Standard Bank (123)", "Standard Bank (456)"]
+    assert out.Description.iloc[0] == "CREDIT TRANSFER CUSTOMER"
+    assert "_Document" not in out.columns
+
+
+def test_upload_repetitions_are_preserved_within_each_document():
+    df = _df([
+        ["22/09/2026", "Pending", 0, 0, 5000, "FNB (123)"],
+        ["22/09/2026", "Pending", 0, 0, 5000, "FNB (123)"],
+        ["22/09/2026", "Pending", 0, 0, 5000, "FNB (123)"],
+    ])
+    df["_Document"] = [0, 0, 1]
+    assert len(_deduplicate_transactions(df)) == 2
+
+
+def test_parse_json_keeps_document_identity_separate_from_account_identity():
+    results = []
+    for index, (number, description) in enumerate([
+        ("12345678901", "CREDIT TRANSFER CUSTOMER"),
+        ("0000012345678901", "CUSTOMER - CREDIT TRANSFER CUSTOMER"),
+        ("12345678902", "CREDIT TRANSFER CUSTOMER"),
+    ]):
+        results.append({
+            "filename": f"statement-{index}.pdf", "error": None,
+            "bank_name": "Standard Bank", "bank_id": "standard_bank",
+            "account_number": number,
+            "df": _df([["22/09/2026", description, 0.0, 2000.0, 5000.0, "ignored"]]),
+        })
+    response = _build_parse_json_sync(results, 3)
+    assert response["successful_files"] == 3
+    assert response["duplicates_removed"] == 1
+    assert response["coverage"]["accounts_detected"] == 2
+    assert len(response["transactions"]) == 2
+    assert all("_Document" not in row for row in response["transactions"])

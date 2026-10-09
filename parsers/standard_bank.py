@@ -23,17 +23,17 @@ class StandardBankParser(BaseBankParser):
 
     # Date format: "17 Nov 22" (DD MMM YY) or "17 Jul 25"
     DATE_PATTERN = re.compile(
-        r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})\b",
+        r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\s+(\d{2})\b",
         re.IGNORECASE,
     )
     # Date format for transactional history: "09 Feb 2026" (DD MMM YYYY)
     DATE_PATTERN_4Y = re.compile(
-        r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})(?:\s|$)",
+        r"^(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\s+(\d{4})(?:\s|$)",
         re.IGNORECASE,
     )
     # Date format for transactional history without year on date line: "22 Oct"
     DATE_PATTERN_NO_YEAR = re.compile(
-        r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b",
+        r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\b",
         re.IGNORECASE,
     )
     # Standalone year line (e.g. "2025" on its own line in transactional history)
@@ -108,7 +108,7 @@ class StandardBankParser(BaseBankParser):
         # Business statement format: "BUSINESS CURRENT ACCOUNT Account Number 02 058 050 9"
         # Read the product even when the generic number pattern already matched.
         acc_match = re.search(
-            r"(BUSINESS\s+\w+\s+ACCOUNT)\s+Account\s+Number[ \t]+(\d[\d \t]*)",
+            r"((?:BUSINESS|MYMOBIZ)\s+\w+\s+ACCOUNT)\s+Account\s+Number[ \t]+(\d[\d \t]*)",
             first_page,
             re.IGNORECASE,
         )
@@ -164,7 +164,7 @@ class StandardBankParser(BaseBankParser):
         labels the closing balance as available or outstanding (overdrawn).
         """
         match = re.search(
-            r"^Balance (?:available|outstanding) at date of statement[ \t]+"
+            r"^Balance (?:(?:available|outstanding) )?at date of statement[ \t]+"
             r"(-?[\d,]+\.\d{2}-?)[ \t]*$",
             self._extract_full_text(),
             re.IGNORECASE | re.MULTILINE,
@@ -188,6 +188,12 @@ class StandardBankParser(BaseBankParser):
     # Business statement (international) line ending: MM DD Balance
     BIZ_INT_END_PATTERN = re.compile(
         r"(\d{2})\s+(\d{2})\s+(-?[\d,]+\.\d{2}-?)\s*$"
+    )
+    BIZ_FOOTER_PATTERN = re.compile(
+        r"^(?:#+\s*)?(?:These fees include VAT|Please verify all transactions|"
+        r"Please visit our website|The Standard Bank of South Africa|"
+        r"VAT Summary|Account Summary)",
+        re.IGNORECASE,
     )
 
     def _detect_format(self) -> str:
@@ -276,7 +282,7 @@ class StandardBankParser(BaseBankParser):
     MONTH_ORDER = {
         "jan": 1, "feb": 2, "mar": 3, "apr": 4,
         "may": 5, "jun": 6, "jul": 7, "aug": 8,
-        "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
     }
 
     def _statement_year_resolver(self, first_page: str, default_year: str):
@@ -326,6 +332,7 @@ class StandardBankParser(BaseBankParser):
         # Detect whether amounts use comma or period as decimal separator
         # by scanning the first page for the respective patterns
         first_page = self._extract_first_page_text()
+        reference_layout = bool(re.search(r"Reference\s+In \(R\)", first_page))
         if self.SA_AMOUNT_PATTERN.search(first_page):
             amt_pattern = self.SA_AMOUNT_PATTERN
             amt_parser = self._parse_sa_amount
@@ -342,6 +349,11 @@ class StandardBankParser(BaseBankParser):
                 line = line.strip()
                 if not line:
                     continue
+
+                if reference_layout and (
+                    line.startswith("#") or self.BIZ_FOOTER_PATTERN.match(line)
+                ):
+                    break
 
                 # Skip header lines
                 if "Date" in line and "Reference" in line:
@@ -404,13 +416,13 @@ class StandardBankParser(BaseBankParser):
                             continue
                     else:
                         if pending_suffix and rows:
-                            pending_suffix = False
                             words = line.split()
-                            is_suffix = len(words) <= 3 and ":" not in line and " - " not in line
+                            is_suffix = (reference_layout or len(words) <= 3) and ":" not in line and " - " not in line
                             if is_suffix:
                                 rows[-1]["Description"] = (rows[-1]["Description"] + " " + line).strip()
                             else:
                                 prev_desc = line
+                            pending_suffix = reference_layout and is_suffix
                         else:
                             prev_desc = line
                         continue
@@ -427,8 +439,8 @@ class StandardBankParser(BaseBankParser):
                 description = rest[:amt_matches[0].start()].strip()
 
                 # If no inline description, use the previous non-date line
-                if not description and prev_desc:
-                    description = prev_desc
+                if prev_desc and (not description or (reference_layout and " - " in prev_desc)):
+                    description = (prev_desc + " " + description).strip()
 
                 # Parse all amounts
                 parsed = [amt_parser(m.group()) for m in amt_matches]
@@ -500,7 +512,7 @@ class StandardBankParser(BaseBankParser):
                     continue
 
                 # Detect footer
-                if "These fees include VAT" in line:
+                if self.BIZ_FOOTER_PATTERN.match(line):
                     break
 
                 # Try to match transaction line (has MM DD Balance at end)
@@ -595,7 +607,7 @@ class StandardBankParser(BaseBankParser):
                     continue
 
                 # Detect footer
-                if "These fees include VAT" in line or "fees include VAT" in line.lower():
+                if self.BIZ_FOOTER_PATTERN.match(line):
                     break
 
                 # Try to match transaction line (has MM DD Balance at end)
