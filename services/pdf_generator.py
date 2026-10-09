@@ -677,10 +677,11 @@ def generate_summary_pdf(
         ACC_AMBER = colors.HexColor("#f59e0b")
         ACC_RED = colors.HexColor("#ef4444")
 
-        acc_data = [["File", "Bank", "Accuracy", "Verified", "Failing", "Total Failures"]]
+        acc_data = [["File", "Bank", "Accuracy", "Checked", "Failed", "Severe"]]
         acc_widths = [1.7 * inch, 0.8 * inch, 0.8 * inch, 0.75 * inch, 0.65 * inch, 1.0 * inch]
         acc_colors = []
         tf_colors = []
+        unverified_count = 0
 
         for vr in verification_results:
             if hasattr(vr, "accuracy_percentage"):
@@ -690,6 +691,7 @@ def generate_summary_pdf(
                 tf = vr.total_failures
                 fname = vr.filename or ""
                 bname = vr.bank_name or ""
+                unverified_count += vr.unverified_transactions
             else:
                 acc_pct = vr.get("accuracy_percentage")
                 verified = vr.get("verified_transactions", 0)
@@ -697,6 +699,7 @@ def generate_summary_pdf(
                 tf = vr.get("total_failures", 0)
                 fname = vr.get("filename", "")
                 bname = vr.get("bank_name", "")
+                unverified_count += vr.get("unverified_transactions", 0)
 
             # ReportLab string cells do not wrap. Allow for 6pt padding on each side.
             fname = _truncate_table_label(fname, 24, acc_widths[0] - 12, "Helvetica-Bold")
@@ -718,6 +721,7 @@ def generate_summary_pdf(
         acc_table = Table(
             acc_data,
             colWidths=acc_widths,
+            repeatRows=1,
         )
         acc_commands = [
             ("LEFTPADDING", (0, 0), (-1, -1), 6),
@@ -748,6 +752,17 @@ def generate_summary_pdf(
 
         acc_table.setStyle(TableStyle(acc_commands))
         elements.append(RoundedTable(acc_table))
+        elements.append(Spacer(1, 6))
+        elements.append(Paragraph(
+            "Checked includes passing and failed balance checks; accuracy is the percentage "
+            "that passed. Severe counts failed checks where the balance difference exceeds "
+            "both the transaction amount and R1; it is a subset of Failed. "
+            f"Transactions without an opening balance to check: {unverified_count}. "
+            "Per-file counts may include entries shared by overlapping statements; "
+            "combined financial totals exclude duplicates.",
+            ParagraphStyle("VerificationNote", parent=styles["Normal"], fontSize=8,
+                           leading=11, textColor=TEXT_DARK),
+        ))
 
     doc.build(elements)
     buffer.seek(0)

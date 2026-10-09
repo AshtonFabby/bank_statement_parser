@@ -772,11 +772,66 @@ def _build_report_from_transactions(transactions: list) -> tuple:
     return combined_df, summary, coverage, activity, revenue
 
 
-def _build_analysis_from_records(records: list):
+def _decode_report_input(raw: str) -> list | dict:
+    """Accept legacy transactions or single-file /parse/json results by document."""
+    try:
+        records = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid transaction JSON.")
+    if isinstance(records, list):
+        if not records or not all(isinstance(row, dict) for row in records):
+            raise HTTPException(status_code=400, detail="Provide a non-empty transaction array.")
+        return records
+    if isinstance(records, dict):
+        documents = records.get("documents")
+        if isinstance(documents, list) and documents:
+            for document in documents:
+                if not isinstance(document, dict):
+                    break
+                rows = document.get("transactions")
+                verification = document.get("verification")
+                if not (isinstance(rows, list) and rows
+                        and all(isinstance(row, dict) for row in rows)
+                        and isinstance(verification, list) and len(verification) == 1
+                        and isinstance(verification[0], dict)
+                        and not verification[0].get("error")
+                        and "verified_transactions" in verification[0]):
+                    break
+            else:
+                return records
+    raise HTTPException(
+        status_code=400,
+        detail="Provide a transaction array or documents containing transactions and single-file verification results.",
+    )
+
+
+def _build_analysis_from_records(records: list | dict):
     """Standardize, verify, and analyze transaction records. Runs in a worker thread.
 
     Returns (combined_df, summary, coverage, activity, revenue, verification_results).
     """
+    if isinstance(records, dict):
+        # Verification belongs to the original statement order and opening
+        # balance. Rechecking a sorted/overlapping account ledger creates false
+        # failures and loses the statement's independent control-total checks.
+        frames = []
+        verification_results = []
+        for index, document in enumerate(records["documents"]):
+            vr = document["verification"][0]
+            frame = pd.DataFrame(document["transactions"])
+            frame["Source"] = _account_source(vr.get("bank_name", ""), vr.get("account_number"))
+            frame["_Document"] = index if vr.get("account_number") else None
+            frames.append(frame)
+            verification_results.append(vr)
+        combined_df = _standardize_dataframe(
+            _deduplicate_transactions(pd.concat(frames, ignore_index=True))
+        )
+        return (
+            combined_df, calculate_summary(combined_df), calculate_coverage(combined_df),
+            calculate_activity_volume(combined_df), calculate_revenue(combined_df),
+            verification_results,
+        )
+
     combined_df, summary, coverage, activity, revenue = _build_report_from_transactions(
         records
     )
@@ -790,7 +845,7 @@ def _build_analysis_from_records(records: list):
     return combined_df, summary, coverage, activity, revenue, verification_results
 
 
-def _build_report_zip_sync(records: list, timestamp: str) -> io.BytesIO:
+def _build_report_zip_sync(records: list | dict, timestamp: str) -> io.BytesIO:
     """Assemble the /report ZIP (Excel + summary PDF). Runs in a worker thread."""
     from services import generate_summary_pdf  # lazy: pulls in reportlab
 
@@ -812,6 +867,14 @@ def _build_report_zip_sync(records: list, timestamp: str) -> io.BytesIO:
         zip_file.writestr(f"combined_summary_{timestamp}.pdf", pdf_buffer.getvalue())
         del pdf_buffer
 
+        zip_file.writestr(
+            f"verification_{timestamp}.json",
+            json.dumps(_sanitize_for_json([
+                vr.to_dict() if hasattr(vr, "to_dict") else vr
+                for vr in verification_results
+            ]), indent=2),
+        )
+
     zip_buffer.seek(0)
     return zip_buffer
 
@@ -824,8 +887,10 @@ async def generate_report(
     """Generate ZIP (Excel + summary PDF) from pre-parsed transaction JSON.
 
     Accepts:
-    - `transactions`: JSON array of transaction records (form field, <=1 MB)
-    - `transactions_file`: Same data as a file upload (no size limit)
+    - `transactions`: JSON array of transaction records (legacy), or
+      {"documents": [{"transactions": [...], "verification": [...]}]} containing
+      one /parse/json result per document, preserving original verification.
+    - `transactions_file`: Same data as a size-limited JSON file upload.
     At least one must be provided. File upload takes precedence.
     """
     raw = None
@@ -839,15 +904,7 @@ async def generate_report(
             status_code=400, detail="'transactions' or 'transactions_file' must be provided."
         )
 
-    try:
-        records = json.loads(raw)
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=400, detail="'transactions' must be a valid JSON array."
-        )
-
-    if not records:
-        raise HTTPException(status_code=400, detail="No transactions provided.")
+    records = _decode_report_input(raw)
 
     del raw
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -870,7 +927,7 @@ async def generate_report(
 
 
 def _build_full_prevet_sync(
-    form_data: dict, records: Optional[list], parsed_results: Optional[list]
+    form_data: dict, records: list | dict | None, parsed_results: Optional[list]
 ) -> io.BytesIO:
     """Build the merged PreVet + bank analysis PDF. Runs in a worker thread."""
     from services import generate_prevet_pdf, generate_summary_pdf  # lazy: reportlab
@@ -969,7 +1026,8 @@ async def generate_full_prevet(
     Accepts:
     - `prevet_data` / `prevet_data_file`: JSON string of prevet form fields
     - `links`: JSON array of bank statement PDF URLs (optional, slow – downloads & parses)
-    - `transactions` / `transactions_file`: JSON array of pre-parsed transaction records (optional, fast)
+    - `transactions` / `transactions_file`: JSON transaction array or the same
+      documents envelope accepted by /report (optional, fast).
     File upload variants bypass the 1 MB multipart field limit.
     If both `transactions` and `links` are provided, `transactions` takes precedence.
     """
@@ -999,12 +1057,7 @@ async def generate_full_prevet(
 
     records = None
     if raw_transactions:
-        try:
-            records = json.loads(raw_transactions)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400, detail="'transactions' must be valid JSON."
-            )
+        records = _decode_report_input(raw_transactions)
         del raw_transactions
 
     async with _HEAVY_SEMAPHORE:
