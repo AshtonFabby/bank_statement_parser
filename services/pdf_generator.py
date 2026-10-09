@@ -612,7 +612,7 @@ def generate_summary_pdf(
         "The Capital Partners": ["THECP"],
         "Tymebank": ["Tymebank"],
         "Genfin": ["Genfin"],
-        "Flow48": ["Elend 48"],
+        "Flow48": ["Elend 48", "ELEND48"],
         "CAPITEC": ["PosSettle CBMPOS"],
     }
 
