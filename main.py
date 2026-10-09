@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import unquote
+from uuid import uuid4
 
 import anyio
 import certifi
@@ -755,6 +756,20 @@ def _build_parse_json_sync(all_results: list, total_count: int) -> dict:
         "duplicates_removed": duplicates_removed,
     }
 
+    # Older dashboards forward only `transactions`, dropping the top-level
+    # verification. Carry a compact envelope through that existing contract.
+    # One marker on every row identifies the statement; its full verification
+    # is stored once, on the first row. Multi-file callers use /report's explicit
+    # documents envelope instead.
+    if total_count == 1 and successful_files == 1 and response["transactions"]:
+        statement_id = uuid4().hex
+        for row in response["transactions"]:
+            row["_StatementId"] = statement_id
+        response["transactions"][0]["_StatementVerification"] = {
+            "transaction_count": len(response["transactions"]),
+            "verification": verification_results[0],
+        }
+
     if errors:
         response["parsing_errors"] = errors
 
@@ -805,11 +820,41 @@ def _decode_report_input(raw: str) -> list | dict:
     )
 
 
+def _restore_statement_documents(records: list) -> dict | None:
+    """Recover original checks when an older client forwards only transaction rows."""
+    if not any("_StatementId" in row for row in records):
+        return None
+    documents = {}
+    for row in records:
+        statement_id = row.get("_StatementId")
+        if not isinstance(statement_id, str) or not statement_id:
+            raise HTTPException(status_code=400, detail="Incomplete statement metadata. Refresh the page and re-analyze all statements.")
+        document = documents.setdefault(statement_id, {"transactions": [], "metadata": []})
+        document["transactions"].append({k: v for k, v in row.items()
+                                         if k not in ("_StatementId", "_StatementVerification")})
+        if row.get("_StatementVerification") is not None:
+            document["metadata"].append(row["_StatementVerification"])
+    restored = []
+    for document in documents.values():
+        metadata = document["metadata"]
+        if (len(metadata) != 1 or not isinstance(metadata[0], dict)
+                or metadata[0].get("transaction_count") != len(document["transactions"])
+                or not isinstance(metadata[0].get("verification"), dict)):
+            raise HTTPException(status_code=400, detail="Incomplete statement metadata. Refresh the page and re-analyze all statements.")
+        restored.append({"transactions": document["transactions"],
+                         "verification": [metadata[0]["verification"]]})
+    return _decode_report_input(json.dumps({"documents": restored}))
+
+
 def _build_analysis_from_records(records: list | dict):
     """Standardize, verify, and analyze transaction records. Runs in a worker thread.
 
     Returns (combined_df, summary, coverage, activity, revenue, verification_results).
     """
+    if isinstance(records, list):
+        restored = _restore_statement_documents(records)
+        if restored is not None:
+            records = restored
     if isinstance(records, dict):
         # Verification belongs to the original statement order and opening
         # balance. Rechecking a sorted/overlapping account ledger creates false
@@ -818,7 +863,9 @@ def _build_analysis_from_records(records: list | dict):
         verification_results = []
         for index, document in enumerate(records["documents"]):
             vr = document["verification"][0]
-            frame = pd.DataFrame(document["transactions"])
+            frame = pd.DataFrame(document["transactions"]).drop(
+                columns=["_StatementId", "_StatementVerification"], errors="ignore"
+            )
             frame["Source"] = _account_source(vr.get("bank_name", ""), vr.get("account_number"))
             frame["_Document"] = index if vr.get("account_number") else None
             frames.append(frame)
@@ -892,6 +939,11 @@ async def generate_report(
       one /parse/json result per document, preserving original verification.
     - `transactions_file`: Same data as a size-limited JSON file upload.
     At least one must be provided. File upload takes precedence.
+
+    Single-file /parse/json transaction arrays also carry _StatementId and
+    _StatementVerification metadata. Forward these fields unchanged to retain
+    per-statement checks with older clients; they are excluded from exports.
+    Incomplete metadata is rejected instead of reporting partial checks.
     """
     raw = None
     if transactions_file:

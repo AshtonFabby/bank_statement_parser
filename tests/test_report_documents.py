@@ -92,16 +92,65 @@ def test_invalid_document_payload_is_rejected(payload):
 
 
 def test_legacy_array_remains_supported(documents):
-    records = main._decode_report_input(json.dumps(documents[0]["transactions"]))
+    rows = [{k: v for k, v in row.items() if not k.startswith("_Statement")}
+            for row in documents[0]["transactions"]]
+    records = main._decode_report_input(json.dumps(rows))
     *_, verification = main._build_analysis_from_records(records)
     assert verification[0].accuracy_percentage == 100
 
 
-def test_report_endpoint_returns_original_verification(documents, monkeypatch):
+def test_old_dashboard_flat_array_preserves_original_checks(documents):
+    records = [row for document in documents for row in document["transactions"]]
+    frame, summary, _, _, _, verification = main._build_analysis_from_records(records)
+    assert verification == [d["verification"][0] for d in documents]
+    assert all(v["failing_transactions"] == 0 for v in verification)
+    assert summary.total_debits == 200
+    assert not any(c.startswith("_Statement") for c in frame.columns)
+
+
+def test_old_dashboard_flat_array_deduplicates_overlapping_documents(documents):
+    repeated = document("repeated.pdf", [
+        ["01/01/2026", "Opening balance", 0, 0, 1000],
+        ["02/01/2026", "Another reference", 100, 0, 900],
+    ])
+    records = [row for doc in documents + [repeated] for row in doc["transactions"]]
+    _, summary, _, _, _, verification = main._build_analysis_from_records(records)
+    assert summary.total_debits == 200
+    assert len(verification) == 3
+
+
+def test_old_dashboard_does_not_hide_real_balance_failures():
+    parsed = document("bad-balance.pdf", [
+        ["02/01/2026", "Initial entry", 100, 0, 900],
+        ["02/01/2026", "Bad balance", 50, 0, 700],
+    ])
+    *_, verification = main._build_analysis_from_records(parsed["transactions"])
+    assert verification == parsed["verification"]
+    assert verification[0]["failing_transactions"] == 1
+    assert verification[0]["unverified_transactions"] == 1
+
+
+@pytest.mark.parametrize("damage", ["missing_row", "missing_metadata", "mixed_metadata"])
+def test_partial_embedded_verification_is_rejected(documents, damage):
+    records = copy.deepcopy([row for doc in documents for row in doc["transactions"]])
+    if damage == "missing_row":
+        records.pop()
+    elif damage == "missing_metadata":
+        records[0].pop("_StatementVerification")
+    else:
+        records[-1].pop("_StatementId")
+    with pytest.raises(HTTPException) as error:
+        main._build_analysis_from_records(records)
+    assert error.value.status_code == 400
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_report_endpoint_returns_original_verification(documents, monkeypatch, flat):
     monkeypatch.setattr(pdf_generator, "_logo_flowable", lambda **_: None)
+    payload = [row for doc in documents for row in doc["transactions"]] if flat else {"documents": documents}
     with TestClient(main.app) as client:
         response = client.post("/report", files={"transactions_file": (
-            "transactions.json", json.dumps({"documents": documents}), "application/json",
+            "transactions.json", json.dumps(payload), "application/json",
         )})
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
@@ -113,15 +162,17 @@ def test_report_endpoint_returns_original_verification(documents, monkeypatch):
         assert "Checked" in text and "Severe" in text
 
 
-def test_full_prevet_endpoint_uses_document_payload(documents, monkeypatch):
+@pytest.mark.parametrize("flat", [False, True])
+def test_full_prevet_endpoint_uses_document_payload(documents, monkeypatch, flat):
     monkeypatch.setattr(pdf_generator, "_logo_flowable", lambda **_: None)
     # Keep the PreVet cover minimal; exercise the actual merged bank report.
     monkeypatch.setattr("services.generate_prevet_pdf", lambda _: pdf_generator.generate_summary_pdf(
         pd.DataFrame(), main.calculate_summary(pd.DataFrame()),
     ))
+    payload = [row for doc in documents for row in doc["transactions"]] if flat else {"documents": documents}
     with TestClient(main.app) as client:
         response = client.post("/generate-full-prevet", data={"prevet_data": "{}"}, files={
-            "transactions_file": ("transactions.json", json.dumps({"documents": documents}), "application/json"),
+            "transactions_file": ("transactions.json", json.dumps(payload), "application/json"),
         })
     assert response.status_code == 200
     text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(response.content)).pages)
