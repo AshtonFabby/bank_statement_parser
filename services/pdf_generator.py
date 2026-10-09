@@ -10,6 +10,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.platypus import (
     Image,
     Paragraph,
@@ -21,6 +22,17 @@ from reportlab.platypus import (
 from reportlab.platypus.flowables import Flowable
 
 from .summary import ActivityVolume, CoverageMetrics, RevenueMetrics, Summary
+
+
+def _truncate_table_label(value, max_chars: int, width: float, font: str) -> str:
+    """Cap a single-line label, including ellipsis, to its padded cell width."""
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars and stringWidth(text, font, 9) <= width:
+        return text
+    prefix = text[:max_chars - 3].rstrip()
+    while prefix and stringWidth(prefix + "...", font, 9) > width:
+        prefix = prefix[:-1].rstrip()
+    return prefix + "..."
 
 
 def _format_date(val) -> str:
@@ -666,6 +678,7 @@ def generate_summary_pdf(
         ACC_RED = colors.HexColor("#ef4444")
 
         acc_data = [["File", "Bank", "Accuracy", "Verified", "Failing", "Total Failures"]]
+        acc_widths = [1.7 * inch, 0.8 * inch, 0.8 * inch, 0.75 * inch, 0.65 * inch, 1.0 * inch]
         acc_colors = []
         tf_colors = []
 
@@ -685,7 +698,10 @@ def generate_summary_pdf(
                 fname = vr.get("filename", "")
                 bname = vr.get("bank_name", "")
 
-            acc_display = f"{acc_pct}%" if acc_pct is not None else "N/A"
+            # ReportLab string cells do not wrap. Allow for 6pt padding on each side.
+            fname = _truncate_table_label(fname, 24, acc_widths[0] - 12, "Helvetica-Bold")
+            bname = _truncate_table_label(bname, 16, acc_widths[1] - 12, "Helvetica")
+            acc_display = f"{acc_pct:.2f}%" if acc_pct is not None else "N/A"
             acc_data.append([fname, bname, acc_display, str(verified), str(failing), str(tf)])
 
             if acc_pct is None:
@@ -701,9 +717,11 @@ def generate_summary_pdf(
 
         acc_table = Table(
             acc_data,
-            colWidths=[1.7 * inch, 0.8 * inch, 0.8 * inch, 0.75 * inch, 0.65 * inch, 1.0 * inch],
+            colWidths=acc_widths,
         )
         acc_commands = [
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
             ("BACKGROUND", (0, 0), (-1, 0), HEADER_BG),
             ("TEXTCOLOR", (0, 0), (-1, 0), GREEN_SECONDARY),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
