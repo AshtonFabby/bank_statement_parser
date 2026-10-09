@@ -4,7 +4,7 @@ import re
 
 import pandas as pd
 
-from .base import AccountInfo, BaseBankParser
+from .base import AccountInfo, BaseBankParser, DeclaredTotals
 from .utils import MONTH_MAP, create_transaction_row, normalize_amount_string
 
 
@@ -52,7 +52,8 @@ class StandardBankParser(BaseBankParser):
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Standard Bank statement."""
         first_page = self._extract_first_page_text()
-        if self._detect_format() == "regular_trailing_fees":
+        statement_format = self._detect_format()
+        if statement_format == "regular_trailing_fees":
             # The address occupies the right half of the same header lines.
             import pdfplumber
 
@@ -105,15 +106,15 @@ class StandardBankParser(BaseBankParser):
                 account_number = acc_match.group(2).strip().replace("-", "")
 
         # Business statement format: "BUSINESS CURRENT ACCOUNT Account Number 02 058 050 9"
-        if not account_number:
-            acc_match = re.search(
-                r"(BUSINESS\s+\w+\s+ACCOUNT)\s+Account\s+Number\s+([\d\s]+)",
-                first_page,
-                re.IGNORECASE,
-            )
-            if acc_match:
-                account_type = acc_match.group(1).strip()
-                account_number = acc_match.group(2).strip().replace(" ", "")
+        # Read the product even when the generic number pattern already matched.
+        acc_match = re.search(
+            r"(BUSINESS\s+\w+\s+ACCOUNT)\s+Account\s+Number[ \t]+(\d[\d \t]*)",
+            first_page,
+            re.IGNORECASE,
+        )
+        if acc_match:
+            account_type = " ".join(acc_match.group(1).split())
+            account_number = re.sub(r"\s", "", acc_match.group(2))
 
         # Current account statement format: "Account 0000220835705 NAME"
         if not account_number:
@@ -149,7 +150,28 @@ class StandardBankParser(BaseBankParser):
             bank=self.BANK_NAME,
             account_number=account_number,
             account_type=account_type,
+            declared_totals=(
+                self._extract_business_declared_totals()
+                if statement_format == "business_statement_int" else None
+            ),
         )
+
+    def _extract_business_declared_totals(self) -> DeclaredTotals | None:
+        """Read the statement-date balance from the business account summary.
+
+        The first-page Month-end Balance can fall inside the statement period,
+        so it is not the closing balance. The final Account Summary instead
+        labels the closing balance as available or outstanding (overdrawn).
+        """
+        match = re.search(
+            r"^Balance (?:available|outstanding) at date of statement[ \t]+"
+            r"(-?[\d,]+\.\d{2}-?)[ \t]*$",
+            self._extract_full_text(),
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if match:
+            return DeclaredTotals(closing_balance=self._clean_amount(match.group(1)))
+        return None
 
     def _clean_amount(self, amt: str) -> float:
         """Clean Standard Bank amount string to float."""
