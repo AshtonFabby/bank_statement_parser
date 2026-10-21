@@ -5,7 +5,7 @@ import re
 import pandas as pd
 import pdfplumber
 
-from .base import AccountInfo, BaseBankParser
+from .base import AccountInfo, BaseBankParser, DeclaredTotals
 from .utils import PATTERNS, create_transaction_row, normalize_amount_string
 
 
@@ -105,7 +105,7 @@ class CapitecParser(BaseBankParser):
             if account_number is None:
                 match = self.ACCOUNT_LABELLED.search(line) or self.ACCOUNT_COLON.search(
                     line
-                )
+                ) or re.match(r"^Account\s+(\d{7,12})\b", line.strip())
                 if match:
                     account_number = match.group(1)
                 elif self.ACCOUNT_LABEL_ONLY.search(line.strip()) and i + 1 < len(lines):
@@ -123,10 +123,24 @@ class CapitecParser(BaseBankParser):
             if account_number and account_type:
                 break
 
+        header = "\n".join(lines)
+        declared = None
+        if "Money In Summary" in header and "Money Out Summary" in header:
+            def summary_amount(label):
+                match = re.search(re.escape(label) + r":?\s*(-?R[\d ,]+\.\d{2})", header)
+                return self._clean_amount(match.group(1)) if match else None
+            money_out = summary_amount("Money Out Summary")
+            declared = DeclaredTotals(
+                opening_balance=summary_amount("Opening Balance"),
+                closing_balance=summary_amount("Closing Balance"),
+                credit_total=summary_amount("Money In Summary"),
+                debit_total=abs(money_out) if money_out is not None else None,
+            )
         return AccountInfo(
             bank=self.BANK_NAME,
             account_number=account_number,
             account_type=account_type,
+            declared_totals=declared,
         )
 
     def _convert_short_year(self, date_str: str) -> str:
