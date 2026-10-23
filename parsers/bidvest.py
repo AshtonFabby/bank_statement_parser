@@ -4,7 +4,7 @@ import re
 
 import pandas as pd
 
-from .base import AccountInfo, BaseBankParser
+from .base import AccountInfo, BaseBankParser, DeclaredTotals
 from .utils import create_transaction_row, parse_date_yyyy_mm_dd, normalize_amount_string
 
 
@@ -15,13 +15,26 @@ class BidvestParser(BaseBankParser):
     BANK_ID = "bidvest"
     DETECTION_KEYWORDS = [
         ("bidvest", 5),
-        ("branch code:462005", 10),
         ("craft hardware", 5),
         ("vilbes investments", 5),
     ]
 
     # Date pattern YYYY/MM/DD
     DATE_PATTERN = re.compile(r"^(\d{4}/\d{2}/\d{2})")
+
+    # Grouped thousands must have exactly three digits. Otherwise a numeric
+    # reference before an amount ("34269041401 160 000.00") becomes money.
+    MONEY = r"-?\s*(?:\d{1,3}(?:[ ,]\d{3})+|\d+)\.\d{2}"
+
+    @classmethod
+    def detection_score(cls, text: str) -> int:
+        # Branding is an image in some exports; the printed branch code is
+        # still available, with varying whitespace around the colon.
+        score = super().detection_score(text)
+        score += 20 * len(re.findall(
+            r"\bBranch\s+Code\s*:\s*462005\b", text, re.IGNORECASE
+        ))
+        return score
 
     def extract_account_info(self) -> AccountInfo:
         """Extract account info from Bidvest Bank statement."""
@@ -52,10 +65,25 @@ class BidvestParser(BaseBankParser):
         if type_match:
             account_type = type_match.group(1).strip()
 
+        if re.search(r"\bBusiness Account\b", first_page, re.IGNORECASE):
+            account_type = "Business Account"
+
+        # Summary categories exclude some reversals, so only use the printed
+        # opening/closing balances as independent controls.
+        balances = {}
+        for field, label in [
+            ("opening_balance", r"Balance Brought Fo(?:r)?ward"),
+            ("closing_balance", r"Closing Balance"),
+        ]:
+            match = re.search(label + r":\s*(" + self.MONEY + r")", first_page, re.IGNORECASE)
+            if match:
+                balances[field] = self._clean_amount(match.group(1))
+
         return AccountInfo(
             bank=self.BANK_NAME,
             account_number=account_number,
             account_type=account_type,
+            declared_totals=DeclaredTotals(**balances) if balances else None,
         )
 
     def _clean_amount(self, amt: str) -> float:
@@ -80,7 +108,7 @@ class BidvestParser(BaseBankParser):
         """
         # Pattern: whitespace, optional minus, optional spaces, digits with spaces/commas, decimal
         # Must be followed by end of string or another amount
-        amount_pattern = re.compile(r'\s(-?\s*[\d\s,]+\.\d{2})(?=\s|$)')
+        amount_pattern = re.compile(r'\s(' + self.MONEY + r')(?=\s|$)')
         matches = list(amount_pattern.finditer(text))
         
         result = []
