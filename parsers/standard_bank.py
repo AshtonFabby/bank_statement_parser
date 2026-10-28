@@ -53,7 +53,9 @@ class StandardBankParser(BaseBankParser):
         """Extract account info from Standard Bank statement."""
         first_page = self._extract_first_page_text()
         statement_format = self._detect_format()
-        if statement_format == "regular_trailing_fees":
+        if statement_format == "regular_trailing_fees" or (
+            statement_format == "regular" and "6 month statement" in first_page
+        ):
             # The address occupies the right half of the same header lines.
             import pdfplumber
 
@@ -805,7 +807,7 @@ class StandardBankParser(BaseBankParser):
             df = self._extract_transactions_regular()
         return self._normalise_chronological_order(df)
 
-    def _extract_transactions_trailing_fees(self) -> pd.DataFrame:
+    def _extract_transactions_trailing_fees(self, *, has_fees: bool = True) -> pd.DataFrame:
         """Read Payments/Deposits/Bank fees by position, excluding fee annotations.
 
         The fee column does not change the row's balance; actual fee debits
@@ -815,34 +817,40 @@ class StandardBankParser(BaseBankParser):
         import pdfplumber
 
         rows = []
+        boundaries = None
         with pdfplumber.open(self.pdf_file) as pdf:
             for page in pdf.pages:
                 lines = page.extract_text_lines(keep_blank_chars=True)
+                header_pattern = (
+                    r"Date\s+Description\s+Payments\s+Deposits\s+Bank fees\s+Balance"
+                    if has_fees else r"Date\s+Description\s+Payments\s+Deposits\s+Balance"
+                )
                 header = next((line for line in lines if re.search(
-                    r"Date\s+Description\s+Payments\s+Deposits\s+Bank fees\s+Balance",
-                    line["text"], re.IGNORECASE,
+                    header_pattern, line["text"], re.IGNORECASE,
                 )), None)
-                if header is None:
+                if header is not None:
+                    words = page.extract_words()
+                    headings = {w["text"]: w for w in words
+                                if abs(w["top"] - header["top"]) < 3}
+                    payment_edge = headings["Payments"]["x1"]
+                    deposit_edge = headings["Deposits"]["x1"]
+                    boundaries = [headings["Description"]["x0"] - 5,
+                                  payment_edge - (deposit_edge - payment_edge) + 2,
+                                  payment_edge + 2, deposit_edge + 2]
+                    if has_fees:
+                        boundaries.append(headings["fees"]["x1"] + 2)
+                elif boundaries is None or has_fees:
                     raise ValueError("Missing Standard Bank transaction columns")
-                words = page.extract_words()
-                headings = {w["text"]: w for w in words
-                            if abs(w["top"] - header["top"]) < 3}
-                # Numeric headings and amounts share right edges. A long
-                # balance starts to the left of the word "Balance" itself.
-                payment_edge = headings["Payments"]["x1"]
-                deposit_edge = headings["Deposits"]["x1"]
-                boundaries = [headings["Description"]["x0"] - 5,
-                              payment_edge - (deposit_edge - payment_edge) + 2,
-                              payment_edge + 2, deposit_edge + 2,
-                              headings["fees"]["x1"] + 2]
+                # Six-month exports omit table headings on continuation pages.
+                # Reuse the column positions, but ignore the repeated letterhead.
                 current = None
                 for line in lines:
-                    if line["top"] <= header["bottom"]:
+                    if header is not None and line["top"] <= header["bottom"]:
                         continue
                     text = line["text"]
                     if text.startswith(("The Standard Bank", "We subscribe", "Please verify", "Statement Summary")):
                         break
-                    cells = [[] for _ in range(6)]
+                    cells = [[] for _ in range(len(boundaries) + 1)]
                     for char in line["chars"]:
                         column = sum(char["x0"] >= edge for edge in boundaries)
                         cells[column].append(char)
@@ -851,17 +859,17 @@ class StandardBankParser(BaseBankParser):
                     if "STATEMENT OPENING BALANCE" in cells[1].upper():
                         rows.append(create_transaction_row(
                             "", "Statement Opening Balance", 0.0, 0.0,
-                            self._clean_amount(cells[5]),
+                            self._clean_amount(cells[-1]),
                         ))
                         continue
                     match = self.DATE_PATTERN.match(cells[0])
-                    if match:
+                    if match and cells[-1]:
                         day, month, year = match.groups()
                         current = create_transaction_row(
                             f"{day.zfill(2)}/{MONTH_MAP[month.lower()]}/20{year}",
                             cells[1], abs(self._clean_amount(cells[2])) if cells[2] else 0.0,
                             abs(self._clean_amount(cells[3])) if cells[3] else 0.0,
-                            self._clean_amount(cells[5]),
+                            self._clean_amount(cells[-1]),
                         )
                         rows.append(current)
                     elif current is not None and cells[1] and not cells[0] and not any(cells[2:]):
@@ -907,7 +915,7 @@ class StandardBankParser(BaseBankParser):
         # it at the bottom where verification cannot use it as the baseline.
         is_opening = (
             reversed_df["Description"].astype(str).str.strip().str.lower()
-            == "opening balance"
+            .isin(["opening balance", "statement opening balance", "balance brought forward"])
         )
         if is_opening.any():
             reversed_df = pd.concat(
@@ -924,6 +932,9 @@ class StandardBankParser(BaseBankParser):
         - Deposits are positive (credits)
         - Balance is the running balance
         """
+        if "6 month statement" in self._extract_first_page_text():
+            return self._extract_transactions_trailing_fees(has_fees=False)
+
         rows = []
 
         for page_text in self._iterate_pages():

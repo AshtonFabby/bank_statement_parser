@@ -76,3 +76,53 @@ def test_existing_regular_layout_routing_is_preserved(columns, expected):
     parser = StandardBankParser(io.BytesIO())
     parser._page_texts_cache = ["Date Description " + columns]
     assert parser._detect_format() == expected
+
+
+def test_six_month_statement_without_repeated_table_headings():
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=(600, 800))
+
+    def header():
+        pdf.setFont("Helvetica", 8)
+        pdf.drawString(20, 780, "STANDARD BANK 6 month statement")
+        pdf.drawString(20, 760, "Account number: 22 123 456 7")
+        pdf.drawString(420, 760, "27 EXAMPLE STREET")
+        pdf.drawString(20, 745, "Product name: BIZLAUNCH")
+        pdf.drawString(420, 745, "EXAMPLE SUBURB")
+        pdf.drawString(20, 720, "26 Oct 2026")
+
+    def row(y, date, description, debit, credit, balance):
+        pdf.drawString(20, y, date)
+        pdf.drawString(95, y, description)
+        for x, value in zip((380, 470, 580), (debit, credit, balance)):
+            pdf.drawRightString(x, y, value)
+
+    header()
+    row(700, "Date", "Description", "Payments", "Deposits", "Balance")
+    row(680, "", "STATEMENT OPENING BALANCE", "", "", "100.00")
+    row(660, "24 Oct 26", "SHOP R10.00", "- 25.00", "", "125.00")
+    pdf.drawString(95, 648, "CHEQUE CARD PURCHASE")
+    pdf.drawString(20, 40, "The Standard Bank of South Africa Limited")
+    pdf.showPage()
+    header()
+    # No table heading on continuation pages. Positive deposits must remain
+    # credits even when a descending export's balance decreases on the page.
+    row(680, "23 Oct 26", "RECEIPT", "", "50.00", "150.00")
+    pdf.drawString(95, 668, "ELECTRONIC BANKING PAYMENT FR")
+    pdf.drawString(20, 640, "Please verify all transactions")
+    pdf.drawString(95, 620, "Statement Summary")
+    pdf.drawString(95, 600, "Today's debits have not yet been paid")
+    pdf.save()
+    buffer.seek(0)
+
+    account, df = StandardBankParser(buffer).parse()
+    assert account.account_type == "BIZLAUNCH"
+    assert account.account_number == "221234567"
+    assert df.Description.tolist() == [
+        "Statement Opening Balance", "RECEIPT ELECTRONIC BANKING PAYMENT FR",
+        "SHOP R10.00 CHEQUE CARD PURCHASE",
+    ]
+    assert df.Date.tolist() == ["", "23/10/2026", "24/10/2026"]
+    assert df.Debit.tolist() == [0, 0, 25]
+    assert df.Credit.tolist() == [0, 50, 0]
+    assert df.Balance.tolist() == [100, 150, 125]
