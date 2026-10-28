@@ -681,31 +681,40 @@ def generate_summary_pdf(
         acc_widths = [1.7 * inch, 0.8 * inch, 0.8 * inch, 0.75 * inch, 0.65 * inch, 1.0 * inch]
         acc_colors = []
         tf_colors = []
-        unverified_count = 0
 
         for vr in verification_results:
             if hasattr(vr, "accuracy_percentage"):
                 acc_pct = vr.accuracy_percentage
+                parsed_pct = vr.parsing_accuracy_percentage
+                extraction_counts = (vr.parsing_checked, vr.parsing_failed, vr.parsing_severe)
                 verified = vr.verified_transactions
                 failing = vr.failing_transactions
                 tf = vr.total_failures
                 fname = vr.filename or ""
                 bname = vr.bank_name or ""
-                unverified_count += vr.unverified_transactions
             else:
                 acc_pct = vr.get("accuracy_percentage")
+                parsed_pct = vr.get("parsing_accuracy_percentage")
+                extraction_counts = tuple(vr.get(key) for key in (
+                    "parsing_checked", "parsing_failed", "parsing_severe",
+                ))
                 verified = vr.get("verified_transactions", 0)
                 failing = vr.get("failing_transactions", 0)
                 tf = vr.get("total_failures", 0)
                 fname = vr.get("filename", "")
                 bname = vr.get("bank_name", "")
-                unverified_count += vr.get("unverified_transactions", 0)
+
+            # Prefer audited extraction accuracy; older parsers retain their
+            # existing balance-based score when no extraction audit is available.
+            if parsed_pct is not None:
+                acc_pct = parsed_pct
+                verified, failing, tf = extraction_counts
 
             # ReportLab string cells do not wrap. Allow for 6pt padding on each side.
             fname = _truncate_table_label(fname, 24, acc_widths[0] - 12, "Helvetica-Bold")
             bname = _truncate_table_label(bname, 16, acc_widths[1] - 12, "Helvetica")
             acc_display = f"{acc_pct:.2f}%" if acc_pct is not None else "N/A"
-            acc_data.append([fname, bname, acc_display, str(verified), str(failing), str(tf)])
+            acc_data.append([fname, bname, acc_display, *[str(value) if value is not None else "N/A" for value in (verified, failing, tf)]])
 
             if acc_pct is None:
                 acc_colors.append(ACC_RED)
@@ -716,7 +725,7 @@ def generate_summary_pdf(
             else:
                 acc_colors.append(ACC_RED)
 
-            tf_colors.append(ACC_RED if tf > 0 else TEXT_DARK)
+            tf_colors.append(ACC_RED if tf is not None and tf > 0 else TEXT_DARK)
 
         acc_table = Table(
             acc_data,
@@ -752,17 +761,6 @@ def generate_summary_pdf(
 
         acc_table.setStyle(TableStyle(acc_commands))
         elements.append(RoundedTable(acc_table))
-        elements.append(Spacer(1, 6))
-        elements.append(Paragraph(
-            "Checked includes passing and failed balance checks; accuracy is the percentage "
-            "that passed. Severe counts failed checks where the balance difference exceeds "
-            "both the transaction amount and R1; it is a subset of Failed. "
-            f"Transactions without an opening balance to check: {unverified_count}. "
-            "Per-file counts may include entries shared by overlapping statements; "
-            "combined financial totals exclude duplicates.",
-            ParagraphStyle("VerificationNote", parent=styles["Normal"], fontSize=8,
-                           leading=11, textColor=TEXT_DARK),
-        ))
 
     doc.build(elements)
     buffer.seek(0)

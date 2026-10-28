@@ -178,3 +178,30 @@ def test_full_prevet_endpoint_uses_document_payload(documents, monkeypatch, flat
     text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(response.content)).pages)
     assert "newer.pdf" in text and "older.pdf" in text
     assert "Severe" in text
+
+
+@pytest.mark.parametrize("parsed,expected", [(100, "100.00%"), (50, "50.00%"), (None, "0.00%")])
+def test_report_uses_extraction_accuracy_in_original_layout(monkeypatch, parsed, expected):
+    monkeypatch.setattr(pdf_generator, "_logo_flowable", lambda **_: None)
+    report = pdf_generator.generate_summary_pdf(
+        pd.DataFrame(), main.calculate_summary(pd.DataFrame()),
+        verification_results=[dict(
+            filename="example.pdf", bank_name="Standard Bank", accuracy_percentage=0,
+            verified_transactions=36, failing_transactions=36, total_failures=26,
+            parsing_accuracy_percentage=parsed,
+            parsing_checked=36, parsing_failed=0 if parsed == 100 else 18, parsing_severe=0,
+        )],
+    )
+    text = "".join(page.extract_text() for page in PdfReader(report).pages)
+    assert "PARSING ACCURACY" in text
+    assert all(label in text for label in ["File", "Bank", "Accuracy", "Checked", "Failed", "Severe"])
+    assert expected in text
+    assert "Balance %" not in text and "Parsed %" not in text and "Controls" not in text
+    assert "source-row extraction checks" not in text
+    assert "Per-file counts" not in text
+    lines = [line.strip() for line in text.splitlines()]
+    index = lines.index(expected)
+    assert lines[index + 1:index + 4] == (
+        ["36", "0", "0"] if parsed == 100 else
+        ["36", "18", "0"] if parsed == 50 else ["36", "36", "26"]
+    )

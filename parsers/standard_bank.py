@@ -154,8 +154,27 @@ class StandardBankParser(BaseBankParser):
             account_type=account_type,
             declared_totals=(
                 self._extract_business_declared_totals()
-                if statement_format == "business_statement_int" else None
+                if statement_format == "business_statement_int"
+                else self._extract_regular_declared_totals()
+                if statement_format == "regular" else None
             ),
+        )
+
+    def _extract_regular_declared_totals(self) -> DeclaredTotals | None:
+        """Read the six-month export's independent payment/deposit summary."""
+        text = self._extract_full_text()
+        summary = re.search(r"Statement Summary(.*)", text, re.DOTALL | re.IGNORECASE)
+        if not summary:
+            return None
+        payments = re.search(r"^Payments\s+-?\s*R\s*([\d,]+\.\d{2})\s*$",
+                             summary.group(1), re.MULTILINE | re.IGNORECASE)
+        deposits = re.search(r"^Deposits\s+R\s*([\d,]+\.\d{2})\s*$",
+                             summary.group(1), re.MULTILINE | re.IGNORECASE)
+        if not payments or not deposits:
+            return None
+        return DeclaredTotals(
+            debit_total=self._clean_amount(payments.group(1)),
+            credit_total=self._clean_amount(deposits.group(1)),
         )
 
     def _extract_business_declared_totals(self) -> DeclaredTotals | None:
@@ -817,6 +836,8 @@ class StandardBankParser(BaseBankParser):
         import pdfplumber
 
         rows = []
+        source_count = 0
+        valid_amount_count = 0
         boundaries = None
         with pdfplumber.open(self.pdf_file) as pdf:
             for page in pdf.pages:
@@ -863,7 +884,17 @@ class StandardBankParser(BaseBankParser):
                         ))
                         continue
                     match = self.DATE_PATTERN.match(cells[0])
+                    # Count source transaction dates even if an amount is missing.
+                    # A bare date in the letterhead is not a transaction row.
+                    if match and (cells[1] or any(cells[2:])):
+                        source_count += 1
                     if match and cells[-1]:
+                        money = r"-?\s*R?\s*-?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}"
+                        amount_cells = [cells[2], cells[3], cells[-1]]
+                        if (any(cells[2:4]) and all(
+                            not value or re.fullmatch(money, value) for value in amount_cells
+                        )):
+                            valid_amount_count += 1
                         day, month, year = match.groups()
                         current = create_transaction_row(
                             f"{day.zfill(2)}/{MONTH_MAP[month.lower()]}/20{year}",
@@ -876,7 +907,19 @@ class StandardBankParser(BaseBankParser):
                         current["Description"] += " " + cells[1]
                 page.flush_cache()
         self._reset_file()
-        return pd.DataFrame(rows)
+        frame = pd.DataFrame(rows)
+        transactions = [row for row in rows if row["Date"]]
+        valid_count = sum(
+            bool(row["Description"].strip())
+            and not pd.isna(pd.to_datetime(row["Date"], format="%d/%m/%Y", errors="coerce"))
+            for row in transactions
+        )
+        frame.attrs["extraction_audit"] = {
+            "source_transactions": source_count,
+            "extracted_transactions": len(transactions),
+            "validated_transactions": min(valid_count, valid_amount_count),
+        }
+        return frame
 
     @staticmethod
     def _normalise_chronological_order(df: pd.DataFrame) -> pd.DataFrame:

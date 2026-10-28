@@ -104,3 +104,67 @@ def test_anchored_statement_has_no_unverified_rows(clean):
     assert result.unverified_transactions == 0
     assert result.verified_transactions == 2
     assert result.opening_balance == 100.0
+
+
+def test_matching_amount_totals_prevent_false_swaps_from_bad_balances():
+    df = _df([
+        ["", "Opening Balance", 0, 0, 100],
+        ["01/01/2026", "Payment", 50, 0, 150],
+        ["02/01/2026", "Deposit", 0, 20, 130],
+    ])
+    corrected, result = verify_and_correct(
+        df, declared_totals=DeclaredTotals(debit_total=50, credit_total=20),
+    )
+    assert corrected.Debit.tolist() == [0, 50, 0]
+    assert corrected.Credit.tolist() == [0, 0, 20]
+    assert result.corrections == 0
+    assert result.failing_transactions == 2
+    assert result.declared_totals_match is True
+
+
+def test_unconfirmed_totals_still_allow_classification_correction():
+    df = _df([
+        ["", "Opening Balance", 0, 0, 100],
+        ["01/01/2026", "Deposit", 50, 0, 150],
+    ])
+    corrected, result = verify_and_correct(
+        df, declared_totals=DeclaredTotals(debit_total=0, credit_total=50),
+    )
+    assert corrected.Credit.tolist() == [0, 50]
+    assert result.corrections == 1
+    assert result.declared_totals_match is True
+
+
+@pytest.mark.parametrize("source,validated,unreadable,expected", [
+    (2, 2, 0, 100), (3, 2, 0, 66.67), (2, 1, 0, 50), (2, 2, 1, 50),
+])
+def test_extraction_score_is_independent_of_balance_errors(source, validated, unreadable, expected):
+    df = _df([
+        ["", "Opening Balance", 0, 0, 100],
+        ["01/01/2026", "Payment", 50, 0, 150],
+        ["02/01/2026", "Deposit", 0, 20, 130],
+    ])
+    df.attrs["extraction_audit"] = dict(
+        source_transactions=source, extracted_transactions=2, validated_transactions=validated,
+    )
+    _, result = verify_and_correct(df, declared_totals=DeclaredTotals(debit_total=50, credit_total=20),
+                                   unreadable_descriptions=unreadable)
+    assert result.parsing_accuracy_percentage == expected
+    assert result.parsing_checked == source
+    assert result.parsing_failed == source - max(0, validated - unreadable)
+    assert result.parsing_severe == max(0, source - 2)
+    assert result.to_dict()["balance_accuracy_percentage"] == 0
+    assert result.failing_transactions == 2
+
+
+def test_totals_alone_do_not_establish_extraction_accuracy(clean, declared):
+    _, result = verify_and_correct(clean, declared_totals=declared)
+    assert result.parsing_accuracy_percentage is None
+
+
+def test_stale_extraction_audit_is_not_accepted(clean):
+    clean.attrs["extraction_audit"] = dict(
+        source_transactions=3, extracted_transactions=3, validated_transactions=3,
+    )
+    _, result = verify_and_correct(clean)
+    assert result.parsing_accuracy_percentage is None

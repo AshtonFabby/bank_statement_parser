@@ -48,7 +48,13 @@ class VerificationResult:
     failing_transactions: int = 0
     total_failures: int = 0
     corrections: int = 0
-    accuracy_percentage: Optional[float] = None
+    accuracy_percentage: Optional[float] = None  # Legacy running-balance score.
+    parsing_accuracy_percentage: Optional[float] = None
+    parsing_checked: Optional[int] = None
+    parsing_failed: Optional[int] = None
+    parsing_severe: Optional[int] = None
+    source_transactions: Optional[int] = None
+    extracted_transactions: Optional[int] = None
     tolerance: float = TOLERANCE
     failures: list = field(default_factory=list)
     error: Optional[str] = None
@@ -80,6 +86,13 @@ class VerificationResult:
             "total_failures": self.total_failures,
             "corrections": self.corrections,
             "accuracy_percentage": self.accuracy_percentage,
+            "balance_accuracy_percentage": self.accuracy_percentage,
+            "parsing_accuracy_percentage": self.parsing_accuracy_percentage,
+            "parsing_checked": self.parsing_checked,
+            "parsing_failed": self.parsing_failed,
+            "parsing_severe": self.parsing_severe,
+            "source_transactions": self.source_transactions,
+            "extracted_transactions": self.extracted_transactions,
             "tolerance": self.tolerance,
             "failures": [
                 f if isinstance(f, dict) else f.__dict__ for f in self.failures
@@ -184,6 +197,17 @@ def verify_and_correct(
     corrections = 0
     unverified_count = 0
 
+    # Independent printed totals can corroborate the original debit/credit
+    # classification even when the statement's running balances are wrong.
+    # Swapping such rows would corrupt amounts that already match the bank.
+    amounts_confirmed = False
+    if declared_totals is not None and len(df):
+        if declared_totals.debit_total is not None and declared_totals.credit_total is not None:
+            mismatches = _check_declared_totals(df, declared_totals)
+            amounts_confirmed = not any(
+                item["field"] in ("debit_total", "credit_total") for item in mismatches
+            )
+
     for idx, row in df.iterrows():
         debit = float(row.get("Debit", 0) or 0)
         credit = float(row.get("Credit", 0) or 0)
@@ -215,7 +239,7 @@ def verify_and_correct(
         # If it fails, check whether swapping debit↔credit would pass.
         # This catches the common parser error where a credit amount is
         # classified as debit (or vice versa).
-        if not passed:
+        if not passed and not amounts_confirmed:
             if debit > 0 and credit == 0:
                 swapped_balance = round(previous_corrected + debit, 2)
                 swapped_diff = round(abs(swapped_balance - actual_balance), 2)
@@ -277,6 +301,20 @@ def verify_and_correct(
         declared_mismatches = _check_declared_totals(corrected, declared_totals)
         declared_match = not declared_mismatches
 
+    # Extraction coverage is independent of running-balance arithmetic. Only
+    # parsers that audit source rows may publish this metric; totals alone
+    # cannot prove that every transaction was captured.
+    audit = df.attrs.get("extraction_audit", {})
+    source_count = audit.get("source_transactions")
+    extracted_count = audit.get("extracted_transactions")
+    parsing_accuracy = None
+    transaction_count = sum(not _is_opening_balance_row(row) for _, row in df.iterrows())
+    if source_count and extracted_count == transaction_count:
+        validated = max(0, audit.get("validated_transactions", 0) - unreadable_descriptions)
+        if not any(item["field"] in ("debit_total", "credit_total", "debit_count", "credit_count")
+                   for item in declared_mismatches):
+            parsing_accuracy = round(min(validated, source_count) / source_count * 100, 2)
+
     result = VerificationResult(
         filename=filename,
         bank_name=bank_name,
@@ -290,6 +328,12 @@ def verify_and_correct(
         total_failures=total_failure_count,
         corrections=corrections,
         accuracy_percentage=accuracy,
+        parsing_accuracy_percentage=parsing_accuracy,
+        parsing_checked=source_count if parsing_accuracy is not None else None,
+        parsing_failed=source_count - min(validated, source_count) if parsing_accuracy is not None else None,
+        parsing_severe=max(0, source_count - extracted_count) if parsing_accuracy is not None else None,
+        source_transactions=source_count,
+        extracted_transactions=extracted_count,
         tolerance=TOLERANCE,
         failures=failures,
         unverified_transactions=unverified_count,

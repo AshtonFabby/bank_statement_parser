@@ -126,3 +126,18 @@ def test_six_month_statement_without_repeated_table_headings():
     assert df.Debit.tolist() == [0, 0, 25]
     assert df.Credit.tolist() == [0, 50, 0]
     assert df.Balance.tolist() == [100, 150, 125]
+    assert df.attrs["extraction_audit"] == dict(
+        source_transactions=2, extracted_transactions=2, validated_transactions=2,
+    )
+
+
+def test_regular_statement_summary_is_an_independent_amount_check():
+    parser = StandardBankParser(io.BytesIO())
+    parser._page_texts_cache = [
+        "Statement Summary\nPayments - R 1,250.00\nDeposits R 1,500.00\n"
+        "Today's debits have not yet been paid"
+    ]
+    totals = parser._extract_regular_declared_totals()
+    assert totals.debit_total == 1250
+    assert totals.credit_total == 1500
+    assert totals.closing_balance is None
