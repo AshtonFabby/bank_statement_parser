@@ -221,6 +221,9 @@ class StandardBankParser(BaseBankParser):
         """Detect which Standard Bank statement format this is."""
         first_page = self._extract_first_page_text()
 
+        if re.search(r"Date\s+Description\s+In \(R\)\s+Out \(R\)", first_page):
+            return "history_description_columns"
+
         if re.search(r"Payments\s+Deposits\s+Bank fees\s+Balance", first_page, re.IGNORECASE):
             return "regular_trailing_fees"
 
@@ -810,7 +813,9 @@ class StandardBankParser(BaseBankParser):
         4. Current account statement: Page | Details | Service Fee | Debit | Credit | Date(YYYYMMDD) | Balance
         """
         fmt = self._detect_format()
-        if fmt == "transactional_history":
+        if fmt == "history_description_columns":
+            df = self._extract_history_description_columns()
+        elif fmt == "transactional_history":
             df = self._extract_transactions_history()
         elif fmt == "business_statement":
             df = self._extract_transactions_business()
@@ -825,6 +830,70 @@ class StandardBankParser(BaseBankParser):
         else:
             df = self._extract_transactions_regular()
         return self._normalise_chronological_order(df)
+
+    def _extract_history_description_columns(self) -> pd.DataFrame:
+        """Read the Description/In/Out history export by column position.
+
+        Amounts can omit decimal places, and references can contain numbers.
+        Bank fees are annotations; posted fees have their own Out rows.
+        """
+        import pdfplumber
+
+        rows = []
+        source_count = 0
+        money = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?")
+        with pdfplumber.open(self.pdf_file) as pdf:
+            for page in pdf.pages:
+                lines = page.extract_text_lines(keep_blank_chars=True)
+                header = next((line for line in lines if re.search(
+                    r"Date\s+Description\s+In \(R\)\s+Out \(R\)\s+Bank fees \(R\)\s+Balance \(R\)",
+                    line["text"],
+                )), None)
+                if header is None:
+                    raise ValueError("Missing Standard Bank history columns")
+                headings = {word["text"]: word for word in page.extract_words()
+                            if abs(word["top"] - header["top"]) < 3}
+                boundaries = [headings[name]["x0"] - 2
+                              for name in ("Description", "In", "Out", "Bank", "Balance")]
+                current = None
+                for line in lines:
+                    if line["top"] <= header["bottom"]:
+                        continue
+                    if line["text"].startswith("#") or self.BIZ_FOOTER_PATTERN.match(line["text"]):
+                        break
+                    cells = [[] for _ in range(6)]
+                    for char in line["chars"]:
+                        cells[sum(char["x0"] >= edge for edge in boundaries)].append(char["text"])
+                    cells = ["".join(cell).strip() for cell in cells]
+                    match = self.DATE_PATTERN_4Y.fullmatch(cells[0])
+                    if match:
+                        source_count += 1
+                        amounts = [cells[2], cells[3], cells[5]]
+                        if not cells[5] or not any(cells[2:4]) or any(
+                            value and not money.fullmatch(value) for value in amounts
+                        ):
+                            raise ValueError("Invalid amount in Standard Bank history row")
+                        day, month, year = match.groups()
+                        current = create_transaction_row(
+                            f"{day}/{MONTH_MAP[month.lower()]}/{year}", cells[1],
+                            abs(self._clean_amount(cells[3])) if cells[3] else 0.0,
+                            abs(self._clean_amount(cells[2])) if cells[2] else 0.0,
+                            self._clean_amount(cells[5]),
+                        )
+                        rows.append(current)
+                    elif current is not None and cells[1] and not cells[0] and not any(cells[2:]):
+                        current["Description"] += " " + cells[1]
+                page.flush_cache()
+        self._reset_file()
+        frame = pd.DataFrame(rows)
+        frame.attrs["extraction_audit"] = dict(
+            source_transactions=source_count, extracted_transactions=len(rows),
+            validated_transactions=sum(
+                bool(row["Description"].strip()) and not pd.isna(pd.to_datetime(
+                    row["Date"], format="%d/%m/%Y", errors="coerce")) for row in rows
+            ),
+        )
+        return frame
 
     def _extract_transactions_trailing_fees(self, *, has_fees: bool = True) -> pd.DataFrame:
         """Read Payments/Deposits/Bank fees by position, excluding fee annotations.
