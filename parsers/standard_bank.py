@@ -841,7 +841,10 @@ class StandardBankParser(BaseBankParser):
 
         rows = []
         source_count = 0
-        money = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?")
+        current_year = self._extract_year_from_date_range()
+        previous_month = 0
+        separate_year = bool(re.search(r"^20\d{2}$", self._extract_first_page_text(), re.MULTILINE))
+        money = re.compile(r"[+-]?\s*(?:\d{1,3}(?:[ ,]\d{3})+|\d+)(?:\.\d{1,2})?")
         with pdfplumber.open(self.pdf_file) as pdf:
             for page in pdf.pages:
                 lines = page.extract_text_lines(keep_blank_chars=True)
@@ -855,6 +858,16 @@ class StandardBankParser(BaseBankParser):
                             if abs(word["top"] - header["top"]) < 3}
                 boundaries = [headings[name]["x0"] - 2
                               for name in ("Description", "In", "Out", "Bank", "Balance")]
+                if separate_year:
+                    # The year-band export right-aligns numbers with the end
+                    # of each heading, including its currency suffix.
+                    currency_ends = [word["x1"] for word in page.extract_words()
+                                     if word["text"] == "(R)"
+                                     and abs(word["top"] - header["top"]) < 3]
+                    credit_end, debit_end, fee_end, _ = currency_ends
+                    boundaries = [headings["Description"]["x0"] - 2,
+                                  credit_end - (debit_end - credit_end) + 2,
+                                  credit_end + 2, debit_end + 2, fee_end + 2]
                 current = None
                 for line in lines:
                     if line["top"] <= header["bottom"]:
@@ -864,8 +877,24 @@ class StandardBankParser(BaseBankParser):
                     cells = [[] for _ in range(6)]
                     for char in line["chars"]:
                         cells[sum(char["x0"] >= edge for edge in boundaries)].append(char["text"])
+                    description_and_credit = "".join(cells[1] + cells[2]).strip()
                     cells = ["".join(cell).strip() for cell in cells]
+                    if separate_year and re.search(r"[A-Za-z]", cells[2]):
+                        # Long descriptions can extend into the unused part
+                        # of the In column. Preserve that text, separating a
+                        # credit only at its explicit sign and numeric suffix.
+                        credit = re.search(money.pattern.replace("[+-]?", "[+-]", 1) + r"$", cells[2])
+                        cells[1] = (description_and_credit[:-len(credit.group())].strip()
+                                    if credit else description_and_credit)
+                        cells[2] = credit.group() if credit else ""
+                    if self.YEAR_LINE_PATTERN.fullmatch(cells[0]) and not any(cells[1:]):
+                        current_year = cells[0]
+                        previous_month = 0
+                        current = None
+                        continue
                     match = self.DATE_PATTERN_4Y.fullmatch(cells[0])
+                    if not match:
+                        match = self.DATE_PATTERN_NO_YEAR.fullmatch(cells[0])
                     if match:
                         source_count += 1
                         amounts = [cells[2], cells[3], cells[5]]
@@ -873,9 +902,17 @@ class StandardBankParser(BaseBankParser):
                             value and not money.fullmatch(value) for value in amounts
                         ):
                             raise ValueError("Invalid amount in Standard Bank history row")
-                        day, month, year = match.groups()
+                        day, month = match.group(1, 2)
+                        month_number = self.MONTH_ORDER[month.lower()]
+                        if len(match.groups()) == 3:
+                            current_year = match.group(3)
+                        elif previous_month == 12 and month_number == 1 and current_year:
+                            current_year = str(int(current_year) + 1)
+                        if current_year is None:
+                            raise ValueError("Missing year in Standard Bank history row")
+                        previous_month = month_number
                         current = create_transaction_row(
-                            f"{day}/{MONTH_MAP[month.lower()]}/{year}", cells[1],
+                            f"{day.zfill(2)}/{MONTH_MAP[month.lower()]}/{current_year}", cells[1],
                             abs(self._clean_amount(cells[3])) if cells[3] else 0.0,
                             abs(self._clean_amount(cells[2])) if cells[2] else 0.0,
                             self._clean_amount(cells[5]),
