@@ -136,7 +136,12 @@ def _detail_card_table(items: list[tuple[str, str]], cols: int, available_width:
         rows.append(value_row)
 
     col_widths = [col_w] * cols
-    t = Table(rows, colWidths=col_widths)
+    t = Table(
+        rows,
+        colWidths=col_widths,
+        repeatRows=1 if len(rows) == 2 else 0,
+        splitInRow=1,
+    )
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), CARD_BG),
         ("BOX", (0, 0), (-1, -1), 0.5, BORDER_COLOR),
@@ -145,7 +150,7 @@ def _detail_card_table(items: list[tuple[str, str]], cols: int, available_width:
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ("LEFTPADDING", (0, 0), (-1, -1), 10),
         ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
     return RoundedTable(t)
 
@@ -164,6 +169,8 @@ def _insight_table(label: str, value: str, explanation: str, available_width: fl
     t = Table(
         [[header], [exp_label], [exp_text]],
         colWidths=[available_width],
+        repeatRows=2,
+        splitInRow=1,
     )
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), CARD_BG),
@@ -188,7 +195,8 @@ def generate_prevet_pdf(form_data: Dict[str, Any]) -> io.BytesIO:
         rightMargin=0.75 * inch,
     )
 
-    available_w = A4[0] - 1.5 * inch
+    # SimpleDocTemplate's frame has 6 points of padding on each side.
+    available_w = doc.width - 12
     elements = []
     styles = getSampleStyleSheet()
 
@@ -253,7 +261,9 @@ def generate_prevet_pdf(form_data: Dict[str, Any]) -> io.BytesIO:
         ["Overdraft 1", _val(form_data, "od1_account"), _val(form_data, "od1_amount")],
         ["Overdraft 2", _val(form_data, "od2_account"), _val(form_data, "od2_amount")],
     ]
-    od_table = Table(od_data, colWidths=[1.2 * inch, 2.9 * inch, 2.9 * inch])
+    od_label_width = 1.2 * inch
+    od_value_width = (available_w - od_label_width) / 2
+    od_table = Table(od_data, colWidths=[od_label_width, od_value_width, od_value_width])
     od_table.setStyle(_green_table_style())
     elements.append(RoundedTable(od_table))
 

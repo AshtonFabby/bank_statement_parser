@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from pypdf import PdfReader
 
 import main
-from services import pdf_generator
+from services import pdf_generator, prevet_pdf_generator
 
 
 def document(filename, rows, account="123"):
@@ -165,17 +165,23 @@ def test_report_endpoint_returns_original_verification(documents, monkeypatch, f
 @pytest.mark.parametrize("flat", [False, True])
 def test_full_prevet_endpoint_uses_document_payload(documents, monkeypatch, flat):
     monkeypatch.setattr(pdf_generator, "_logo_flowable", lambda **_: None)
-    # Keep the PreVet cover minimal; exercise the actual merged bank report.
-    monkeypatch.setattr("services.generate_prevet_pdf", lambda _: pdf_generator.generate_summary_pdf(
-        pd.DataFrame(), main.calculate_summary(pd.DataFrame()),
-    ))
+    monkeypatch.setattr(prevet_pdf_generator, "_logo_flowable", lambda **_: None)
+    arrears_notes = [f"arrears{i:04d}" for i in range(700)]
+    motivation_notes = [f"motivation{i:04d}" for i in range(700)]
+    form = {
+        "rental_arrears_explanation": " ".join(arrears_notes),
+        "motivation": " ".join(motivation_notes),
+    }
     payload = [row for doc in documents for row in doc["transactions"]] if flat else {"documents": documents}
     with TestClient(main.app) as client:
-        response = client.post("/generate-full-prevet", data={"prevet_data": "{}"}, files={
+        response = client.post("/generate-full-prevet", data={"prevet_data": json.dumps(form)}, files={
             "transactions_file": ("transactions.json", json.dumps(payload), "application/json"),
         })
     assert response.status_code == 200
     text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(response.content)).pages)
+    words = text.split()
+    assert [word for word in words if word.startswith("arrears")] == arrears_notes
+    assert [word for word in words if word.startswith("motivation")] == motivation_notes
     assert "newer.pdf" in text and "older.pdf" in text
     assert "Severe" in text
 
